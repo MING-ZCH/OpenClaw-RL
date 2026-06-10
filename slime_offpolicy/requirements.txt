@@ -1,0 +1,16 @@
+accelerate
+blobfile
+datasets
+httpx[http2]
+mcp[cli]
+omegaconf
+pillow
+pylatexenc
+pyyaml
+ray[default]
+ring_flash_attn
+# 0.2.2 removes `/add_worker` endpoint
+sglang-router==0.2.1
+tensorboard
+transformers
+wandb
