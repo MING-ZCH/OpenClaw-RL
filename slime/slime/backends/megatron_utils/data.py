@@ -538,6 +538,8 @@ def log_rollout_data(
                 "group_indices",
                 "teacher_topk_log_probs",
                 "teacher_topk_indices",
+                "sil_precomputed_advantages",
+                "sil_reward_baseline",
             ]:
                 continue
             # Upload per sample mean for each rollout value

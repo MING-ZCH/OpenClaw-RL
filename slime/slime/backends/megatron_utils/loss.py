@@ -10,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
+from .initialize import is_megatron_main_rank
 
 logger = logging.getLogger(__name__)
 from slime.utils.ppo_utils import (
@@ -31,6 +32,60 @@ from .cp_utils import (
     get_sum_of_sample_mean,
     slice_log_prob_with_cp,
 )
+
+
+def _local_response_loss_masks(
+    loss_masks: list[torch.Tensor],
+    total_lengths: list[int],
+    response_lengths: list[int],
+    qkv_format: str,
+    max_seq_lens: list[int] | None,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> list[torch.Tensor]:
+    """Return response-space masks aligned to this rank's local log-prob layout."""
+    local_masks = []
+    for i, (loss_mask, total_length, response_length) in enumerate(
+        zip(loss_masks, total_lengths, response_lengths, strict=False)
+    ):
+        mask = loss_mask.to(device=device, dtype=dtype)
+        max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
+        if mpu.get_context_parallel_world_size() > 1:
+            mask = slice_log_prob_with_cp(mask, total_length, response_length, qkv_format, max_seq_len)
+        local_masks.append(mask)
+    return local_masks
+
+
+def _local_sum_of_sample_mean(
+    local_loss_masks: list[torch.Tensor],
+    calculate_per_token_loss: bool,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Reducer for vectors already sliced to this CP rank's response-token layout."""
+    lengths = [int(mask.numel()) for mask in local_loss_masks]
+    if not local_loss_masks:
+        return lambda x: x.sum()
+
+    denoms = torch.stack([mask.sum() for mask in local_loss_masks])
+    if mpu.get_context_parallel_world_size() > 1 and dist.is_initialized():
+        denoms = denoms.clone()
+        dist.all_reduce(denoms, group=mpu.get_context_parallel_group())
+
+    def sum_of_sample_mean(x: torch.Tensor) -> torch.Tensor:
+        total = torch.zeros((), dtype=x.dtype, device=x.device)
+        for x_i, mask_i, denom_i in zip(x.split(lengths, dim=0), local_loss_masks, denoms, strict=False):
+            total = total + (x_i * mask_i.to(device=x.device, dtype=x.dtype)).sum() / torch.clamp_min(
+                denom_i.to(device=x.device, dtype=x.dtype), 1
+            )
+        return total
+
+    def sum_of_token(x: torch.Tensor) -> torch.Tensor:
+        total = torch.zeros((), dtype=x.dtype, device=x.device)
+        for x_i, mask_i in zip(x.split(lengths, dim=0), local_loss_masks, strict=False):
+            total = total + (x_i * mask_i.to(device=x.device, dtype=x.dtype)).sum()
+        return total
+
+    return sum_of_token if calculate_per_token_loss else sum_of_sample_mean
 
 
 def get_responses(
@@ -914,6 +969,313 @@ def sft_loss_function(
     )
 
 
+def decoupled_policy_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute off-policy decoupled PPO/GRPO loss.
+
+    The objective separates the proximal ratio pi_theta/pi_prox from the
+    behavior correction pi_prox/pi_behav, so replayed samples can be trained
+    with bounded off-policy correction.
+    """
+    from slime.utils.offpolicy_utils import (
+        aggregate_importance_weights,
+        apply_m2po_filtering,
+        compute_decoupled_policy_loss,
+        compute_offpolicy_importance_weights,
+    )
+
+    advantages = torch.cat(batch["advantages"], dim=0)
+    response_lengths = batch["response_lengths"]
+    total_lengths = batch["total_lengths"]
+    max_seq_lens = batch.get("max_seq_lens", None)
+
+    _, log_probs_and_entropy = get_log_probs_and_entropy(
+        logits,
+        args=args,
+        unconcat_tokens=batch["unconcat_tokens"],
+        total_lengths=total_lengths,
+        response_lengths=response_lengths,
+        with_entropy=True,
+        max_seq_lens=max_seq_lens,
+    )
+    log_probs = log_probs_and_entropy["log_probs"]
+    entropy = log_probs_and_entropy["entropy"]
+
+    if batch.get("use_proximal_logp_approximation", False):
+        from slime.utils.proximal_logp_utils import resolve_proximal_logp
+
+        prox_logp_method = getattr(args, "prox_logp_method", "recompute")
+        if prox_logp_method == "metrics":
+            if is_megatron_main_rank():
+                logger.warning(
+                    "prox_logp_method=metrics requires recomputed proximal_log_probs; "
+                    "using loglinear approximation for training because approximation mode was requested."
+                )
+            prox_logp_method = "loglinear"
+
+        rollout_log_probs_for_approx = batch.get("rollout_log_probs")
+        policy_versions = batch.get("policy_versions")
+        current_policy_version = batch.get("current_policy_version")
+        if rollout_log_probs_for_approx is None or policy_versions is None or current_policy_version is None:
+            raise ValueError(
+                "proximal logp approximation requires rollout_log_probs, policy_versions, "
+                "and current_policy_version in the batch."
+            )
+        if isinstance(current_policy_version, list):
+            current_policy_version = int(current_policy_version[0])
+
+        proximal_log_probs = []
+        for current_logp, behavior_logp, policy_version in zip(
+            log_probs,
+            rollout_log_probs_for_approx,
+            policy_versions,
+            strict=False,
+        ):
+            behavior_logp = behavior_logp.to(device=current_logp.device, dtype=current_logp.dtype)
+            token_versions = torch.full(
+                (int(current_logp.numel()),),
+                int(policy_version),
+                dtype=torch.long,
+                device=current_logp.device,
+            )
+            proximal_log_probs.append(
+                resolve_proximal_logp(
+                    prox_logp_gt=None,
+                    prox_logp_method=prox_logp_method,
+                    old_logp=behavior_logp,
+                    logprobs=current_logp.detach(),
+                    versions=token_versions,
+                    current_version=int(current_policy_version),
+                )
+            )
+    else:
+        if "proximal_log_probs" not in batch or batch["proximal_log_probs"] is None:
+            raise ValueError(
+                "batch must contain 'proximal_log_probs' for decoupled_policy_loss. "
+                "Make sure train_actor() computes proximal log probabilities before training."
+            )
+        proximal_log_probs = batch["proximal_log_probs"]
+
+    if "behavior_log_probs" in batch and batch["behavior_log_probs"] is not None:
+        behavior_log_probs = batch["behavior_log_probs"]
+    elif "rollout_log_probs" in batch and batch["rollout_log_probs"] is not None:
+        behavior_log_probs = batch["rollout_log_probs"]
+    elif "log_probs" in batch and batch["log_probs"] is not None:
+        behavior_log_probs = batch["log_probs"]
+    else:
+        raise ValueError(
+            "batch must contain either 'behavior_log_probs', 'rollout_log_probs', or 'log_probs' "
+            "for off-policy importance sampling"
+        )
+
+    proximal_log_probs_list = list(proximal_log_probs) if isinstance(proximal_log_probs, list) else None
+    behavior_log_probs_list = list(behavior_log_probs) if isinstance(behavior_log_probs, list) else None
+    per_weight_vector = None
+
+    log_probs = torch.cat(log_probs, dim=0)
+    proximal_log_probs = torch.cat(proximal_log_probs, dim=0)
+    behavior_log_probs = torch.cat(behavior_log_probs, dim=0)
+    loss_masks_list = (
+        _local_response_loss_masks(
+            list(batch.get("loss_masks", [])),
+            total_lengths,
+            response_lengths,
+            args.qkv_format,
+            max_seq_lens,
+            device=log_probs.device,
+            dtype=log_probs.dtype,
+        )
+        if batch.get("loss_masks") is not None
+        else None
+    )
+
+    if log_probs.shape != proximal_log_probs.shape:
+        raise RuntimeError(
+            f"Shape mismatch between log_probs {log_probs.shape} and proximal_log_probs {proximal_log_probs.shape}."
+        )
+    if log_probs.shape != behavior_log_probs.shape:
+        raise RuntimeError(
+            f"Shape mismatch between log_probs {log_probs.shape} and behavior_log_probs {behavior_log_probs.shape}."
+        )
+
+    importance_weights = compute_offpolicy_importance_weights(
+        proximal_log_probs,
+        behavior_log_probs,
+        clip_min=getattr(args, "importance_weight_clip_min", None),
+        clip_max=getattr(args, "importance_weight_clip_max", None),
+    )
+
+    topr_metrics: dict[str, torch.Tensor] = {}
+    if (
+        getattr(args, "use_topr", False)
+        and proximal_log_probs_list is not None
+        and behavior_log_probs_list is not None
+        and loss_masks_list is not None
+    ):
+        try:
+            from slime.utils.topr_utils import blend_token_and_seq_weights, compute_topr_seq_weights
+
+            w_seq_per_sample, w_seq_token = compute_topr_seq_weights(
+                proximal_log_probs_list,
+                behavior_log_probs_list,
+                loss_masks_list,
+                logw_cap=float(getattr(args, "topr_logw_cap", 2.0)),
+                w_min=float(getattr(args, "topr_w_min", 0.0)),
+                w_max=float(getattr(args, "topr_w_max", 5.0)),
+            )
+            blend = float(getattr(args, "topr_blend", 1.0))
+            importance_weights = blend_token_and_seq_weights(
+                importance_weights, w_seq_token.to(importance_weights.dtype), blend
+            )
+            topr_metrics["topr_w_seq_mean"] = w_seq_per_sample.detach().mean()
+            topr_metrics["topr_w_seq_max"] = w_seq_per_sample.detach().max()
+            topr_metrics["topr_w_seq_min"] = w_seq_per_sample.detach().min()
+            topr_metrics["topr_blend_lambda"] = torch.tensor(
+                blend, device=importance_weights.device, dtype=torch.float32
+            )
+        except Exception as exc:
+            if is_megatron_main_rank():
+                logger.warning("TOPR disabled due to error: %s", exc)
+
+    per_metrics: dict[str, torch.Tensor] = {}
+    per_is_weights = batch.get("per_is_weights", None)
+    if per_is_weights is not None and loss_masks_list is not None and len(per_is_weights) == len(loss_masks_list):
+        try:
+            weights_tensor = torch.tensor(
+                list(per_is_weights), dtype=torch.float32, device=importance_weights.device
+            )
+            per_token_weights = [
+                torch.full(
+                    (int(token_log_probs.numel()),),
+                    float(weight),
+                    dtype=importance_weights.dtype,
+                    device=importance_weights.device,
+                )
+                for weight, token_log_probs in zip(per_is_weights, proximal_log_probs_list, strict=False)
+            ]
+            per_weight_vector = torch.cat(per_token_weights, dim=0) if per_token_weights else None
+            if per_weight_vector is not None and per_weight_vector.shape != importance_weights.shape:
+                raise RuntimeError(
+                    f"PER token weight shape {per_weight_vector.shape} does not match loss shape {importance_weights.shape}"
+                )
+            per_metrics["per_is_weight_mean"] = weights_tensor.mean()
+            per_metrics["per_is_weight_min"] = weights_tensor.min()
+            per_metrics["per_is_weight_max"] = weights_tensor.max()
+        except Exception as exc:
+            if is_megatron_main_rank():
+                logger.warning("PER IS weight broadcast failed: %s", exc)
+            per_weight_vector = None
+
+    log_ratio_intermediate = proximal_log_probs - log_probs
+
+    m2po_metrics: dict[str, torch.Tensor] = {}
+    effective_sum_of_sample_mean = sum_of_sample_mean
+    if getattr(args, "enable_m2po_filtering", False):
+        if loss_masks_list is None:
+            raise ValueError("M2PO filtering requires loss_masks in the batch.")
+        delta = behavior_log_probs - proximal_log_probs
+        m2 = delta * delta
+        total_tokens_before = sum(mask.sum().item() for mask in loss_masks_list)
+        modified_loss_masks, num_filtered = apply_m2po_filtering(
+            m2=m2,
+            loss_masks=loss_masks_list,
+            threshold=getattr(args, "m2po_threshold", 0.1),
+            policy_version_gaps=None,
+            min_gap_for_filtering=0,
+        )
+        loss_masks_list = modified_loss_masks
+        effective_sum_of_sample_mean = _local_sum_of_sample_mean(
+            loss_masks_list,
+            args.calculate_per_token_loss,
+        )
+        filter_rate = num_filtered / max(total_tokens_before, 1)
+        m2po_metrics["m2po_num_filtered_tokens"] = torch.tensor(
+            num_filtered, dtype=torch.float32, device=log_probs.device
+        )
+        m2po_metrics["m2po_total_tokens"] = torch.tensor(
+            total_tokens_before, dtype=torch.float32, device=log_probs.device
+        )
+        m2po_metrics["m2po_filter_rate"] = torch.tensor(
+            filter_rate, dtype=torch.float32, device=log_probs.device
+        )
+
+    pg_loss, pg_clipfrac = compute_decoupled_policy_loss(
+        log_ratio_intermediate,
+        importance_weights,
+        advantages,
+        args.eps_clip,
+        args.eps_clip_high,
+        behav_imp_weight_cap=getattr(args, "behav_imp_weight_cap", None),
+    )
+    if per_weight_vector is not None:
+        pg_loss = pg_loss * per_weight_vector
+    pg_loss = effective_sum_of_sample_mean(pg_loss)
+    pg_clipfrac = effective_sum_of_sample_mean(pg_clipfrac)
+
+    entropy = torch.cat(entropy, dim=0)
+    entropy_loss = effective_sum_of_sample_mean(entropy)
+    loss = pg_loss - args.entropy_coef * entropy_loss
+
+    if args.use_kl_loss:
+        ref_log_probs = torch.cat(batch["ref_log_probs"], dim=0)
+        kl = compute_approx_kl(log_probs, ref_log_probs, kl_loss_type=args.kl_loss_type)
+        kl_loss = effective_sum_of_sample_mean(kl)
+        loss = loss + args.kl_loss_coef * kl_loss
+
+    if log_probs.numel() == 0:
+        loss += 0 * logits.sum()
+
+    all_masks = torch.cat(loss_masks_list, dim=0) if loss_masks_list is not None else torch.ones_like(importance_weights)
+    reported_loss = {
+        "loss": loss.clone().detach(),
+        "pg_loss": pg_loss.clone().detach(),
+        "entropy_loss": entropy_loss.clone().detach(),
+        "pg_clipfrac": pg_clipfrac.clone().detach(),
+        "ppo_kl_prox": effective_sum_of_sample_mean(log_ratio_intermediate).clone().detach(),
+        "importance_weight_mean": aggregate_importance_weights(
+            importance_weights, all_masks, method="mean"
+        ).clone().detach(),
+        "importance_weight_max": aggregate_importance_weights(
+            importance_weights, all_masks, method="max"
+        ).clone().detach(),
+        "effective_sample_size": aggregate_importance_weights(
+            importance_weights, all_masks, method="effective_sample_size"
+        ).clone().detach(),
+    }
+
+    if args.use_kl_loss:
+        reported_loss["kl_loss"] = kl_loss.clone().detach()
+
+    if batch.get("policy_versions") is not None and batch.get("current_policy_version") is not None:
+        from slime.utils.offpolicy_utils import compute_policy_version_staleness
+
+        current_version = (
+            batch["current_policy_version"][0]
+            if isinstance(batch["current_policy_version"], list)
+            else batch["current_policy_version"]
+        )
+        staleness = compute_policy_version_staleness(batch["policy_versions"], current_version)
+        reported_loss["mean_staleness"] = staleness.float().mean().clone().detach()
+        reported_loss["max_staleness"] = staleness.max().clone().detach()
+
+    for metric_group in (topr_metrics, per_metrics, m2po_metrics):
+        for metric_name, metric_value in metric_group.items():
+            reported_loss[metric_name] = (
+                metric_value.clone().detach()
+                if isinstance(metric_value, torch.Tensor)
+                else torch.tensor(float(metric_value), device=log_probs.device)
+            )
+
+    if batch.get("use_proximal_logp_approximation", False):
+        reported_loss["prox_logp_approximation_enabled"] = torch.tensor(1.0, device=log_probs.device)
+
+    return loss, reported_loss
+
+
 def loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -943,7 +1305,6 @@ def loss_function(
         - `logging_dict` has keys "keys" (list of str metric names) and
           "values" (1D tensor: [count, metric1, metric2, ...]).
     """
-    num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
     num_samples = len(batch["response_lengths"])
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
@@ -957,6 +1318,8 @@ def loss_function(
     match args.loss_type:
         case "policy_loss":
             func = policy_loss_function
+        case "decoupled_policy_loss":
+            func = decoupled_policy_loss_function
         case "value_loss":
             func = value_loss_function
         case "sft_loss":
@@ -971,6 +1334,15 @@ def loss_function(
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)
 
+    # Megatron's pipeline schedule accumulates this value into an integer
+    # `total_num_tokens` tensor.  The masks are floating-point tensors because
+    # they also weight the loss, so use an integer nonzero count for the
+    # Megatron normalizer while keeping the loss reducer above unchanged.
+    num_tokens = torch.zeros((), dtype=torch.int, device=logits.device)
+    for loss_mask in batch["loss_masks"]:
+        valid_tokens = torch.count_nonzero(loss_mask).to(device=logits.device, dtype=torch.int)
+        num_tokens = num_tokens + torch.clamp_min(valid_tokens, 1)
+
     # Here we need to divide by cp_size because to cancel the multiply in Megatron.
     global_batch_size = batch.get("dynamic_global_batch_size", args.global_batch_size)
     if not args.calculate_per_token_loss:
@@ -982,7 +1354,7 @@ def loss_function(
 
     return (
         loss,
-        (num_tokens if args.calculate_per_token_loss else torch.tensor(1, device=logits.device)),
+        (num_tokens if args.calculate_per_token_loss else torch.tensor(1, dtype=torch.int, device=logits.device)),
         {
             "keys": list(log.keys()),
             "values": torch.tensor(

@@ -2,6 +2,8 @@ import asyncio
 import copy
 import inspect
 import logging
+import os
+import time
 from argparse import Namespace
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -29,6 +31,169 @@ from .rm_hub import async_rm, batched_async_rm
 __all__ = ["generate_rollout"]
 
 logger = logging.getLogger(__name__)
+
+
+def _iter_leaf_samples(value: Any):
+    if isinstance(value, Sample):
+        yield value
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_leaf_samples(item)
+
+
+def _group_sample_stats(group: list[Sample] | list[list[Sample]]) -> dict[str, int]:
+    samples = list(_iter_leaf_samples(group))
+    removed = sum(1 for sample in samples if getattr(sample, "remove_sample", False))
+    failed = sum(1 for sample in samples if sample.status == Sample.Status.FAILED)
+    aborted = sum(1 for sample in samples if sample.status == Sample.Status.ABORTED)
+    return {
+        "samples": len(samples),
+        "removed": removed,
+        "failed": failed,
+        "aborted": aborted,
+        "all_removed": int(bool(samples) and removed == len(samples)),
+        "all_failed": int(bool(samples) and failed == len(samples)),
+        "any_removed": int(removed > 0),
+        "any_failed": int(failed > 0),
+    }
+
+
+def _dynamic_sampling_max_groups(args: Namespace, target_data_size: int) -> int | None:
+    raw = getattr(args, "dynamic_sampling_max_groups", None)
+    if raw is not None:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 0
+        return value if value > 0 else None
+
+    if getattr(args, "dynamic_sampling_filter_path", None) is None:
+        return None
+
+    # Keep the default permissive for ordinary DAPO rejection sampling, while
+    # still preventing unbounded replenishment when the environment repeatedly
+    # returns non-trainable samples.
+    over_sampling_batch_size = max(1, int(getattr(args, "over_sampling_batch_size", target_data_size) or 1))
+    return max(target_data_size * 64, over_sampling_batch_size * 64)
+
+
+def _dynamic_sampling_max_seconds(args: Namespace) -> float | None:
+    raw = getattr(args, "dynamic_sampling_max_seconds", None)
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _rollout_abort_wait_timeout(args: Namespace) -> float:
+    raw = getattr(args, "rollout_abort_wait_timeout", None)
+    if raw is None:
+        raw = getattr(args, "dynamic_sampling_max_seconds", None)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 300.0
+    return value if value > 0 else 300.0
+
+
+def _dynamic_sampling_failed_group_abort_min_groups(args: Namespace, target_data_size: int) -> int | None:
+    raw = getattr(args, "dynamic_sampling_failed_group_abort_min_groups", None)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return max(1, min(value, target_data_size))
+
+
+def _dynamic_sampling_failed_group_abort_ratio(args: Namespace) -> float:
+    raw = getattr(args, "dynamic_sampling_failed_group_abort_ratio", 1.0)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 1.0
+    return min(max(value, 0.0), 1.0)
+
+
+def _should_abort_for_failed_rollout_groups(
+    *,
+    completed_groups: int,
+    kept_groups: int,
+    failed_groups: int,
+    min_groups: int | None,
+    ratio: float,
+) -> bool:
+    if min_groups is None:
+        return False
+    if kept_groups > 0 or completed_groups < min_groups or completed_groups <= 0:
+        return False
+    if failed_groups <= 0:
+        return False
+    return failed_groups / completed_groups >= ratio
+
+
+def _format_dynamic_sampling_state(
+    *,
+    rollout_id: int,
+    target_data_size: int,
+    submitted_groups: int,
+    completed_groups: int,
+    kept_groups: int,
+    dropped_groups: int,
+    removed_groups: int,
+    failed_groups: int,
+    failed_samples: int,
+    removed_samples: int,
+    pending_groups: int,
+    max_groups: int | None,
+    max_seconds: float | None,
+    failed_group_abort_min_groups: int | None = None,
+    failed_group_abort_ratio: float | None = None,
+) -> str:
+    return (
+        f"rollout_id={rollout_id} target_groups={target_data_size} "
+        f"kept={kept_groups} dropped={dropped_groups} "
+        f"submitted={submitted_groups} completed={completed_groups} pending={pending_groups} "
+        f"removed_groups={removed_groups} failed_groups={failed_groups} "
+        f"removed_samples={removed_samples} failed_samples={failed_samples} "
+        f"max_groups={max_groups if max_groups is not None else 'disabled'} "
+        f"max_seconds={max_seconds if max_seconds is not None else 'disabled'} "
+        f"failed_group_abort_min_groups="
+        f"{failed_group_abort_min_groups if failed_group_abort_min_groups is not None else 'disabled'} "
+        f"failed_group_abort_ratio="
+        f"{failed_group_abort_ratio if failed_group_abort_ratio is not None else 'disabled'}"
+    )
+
+
+async def _cancel_pending_generation_tasks(args: Namespace, reason: str) -> None:
+    state = GenerateState(args)
+    pending = set(state.pendings)
+    if not pending:
+        state.reset()
+        return
+
+    logger.warning("Canceling %d pending rollout generation tasks: %s", len(pending), reason)
+    state.aborted = True
+    for task in pending:
+        task.cancel()
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*pending, return_exceptions=True),
+            timeout=_rollout_abort_wait_timeout(args),
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Timed out waiting for %d canceled rollout generation tasks: %s",
+            len(pending),
+            reason,
+        )
+    state.reset()
 
 
 def _train_step_start(args: Namespace, rollout_id: int) -> int:
@@ -332,24 +497,44 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
 
     # make sure all the pending tasks are finished
     count = 0
+    deadline = time.monotonic() + _rollout_abort_wait_timeout(args)
     while state.pendings:
-        done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
+        timeout = max(0.0, deadline - time.monotonic())
+        if timeout <= 0:
+            logger.warning(
+                "Timed out waiting for %d pending rollout generation tasks during abort; canceling leftovers",
+                len(state.pendings),
+            )
+            await _cancel_pending_generation_tasks(args, "rollout abort wait timeout")
+            break
 
-        if not args.partial_rollout:
-            continue
+        done, state.pendings = await asyncio.wait(
+            state.pendings,
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            logger.warning(
+                "Timed out waiting for %d pending rollout generation tasks during abort; canceling leftovers",
+                len(state.pendings),
+            )
+            await _cancel_pending_generation_tasks(args, "rollout abort wait timeout")
+            break
 
-        # for partial rollout, collect the partial samples into the data buffer
-        for task in done:
-            group = task.result()
-            for sample in group:
-                if sample.response and "start_rollout_id" not in sample.metadata:
-                    sample.metadata["start_rollout_id"] = rollout_id
-            aborted_samples.append(group)
-            count += len(group)
+        if args.partial_rollout:
+            # for partial rollout, collect the partial samples into the data buffer
+            for task in done:
+                group = task.result()
+                for sample in group:
+                    if sample.response and "start_rollout_id" not in sample.metadata:
+                        sample.metadata["start_rollout_id"] = rollout_id
+                aborted_samples.append(group)
+                count += len(group)
 
     if args.partial_rollout:
         logger.info(f"Collected {count} partial samples into the data buffer")
 
+    state.reset()
     return aborted_samples
 
 
@@ -381,43 +566,202 @@ async def generate_rollout_async(
 
     # target_data_size is the total number of valid samples to get
     target_data_size = args.rollout_batch_size
+    max_groups = _dynamic_sampling_max_groups(args, target_data_size)
+    max_seconds = _dynamic_sampling_max_seconds(args)
+    failed_group_abort_min_groups = _dynamic_sampling_failed_group_abort_min_groups(args, target_data_size)
+    failed_group_abort_ratio = _dynamic_sampling_failed_group_abort_ratio(args)
+    deadline = time.monotonic() + max_seconds if max_seconds is not None else None
 
     data = []
     all_data = []
     do_print = True
+    submitted_groups = 0
+    completed_groups = 0
+    kept_groups = 0
+    dropped_groups = 0
+    removed_groups = 0
+    failed_groups = 0
+    removed_samples = 0
+    failed_samples = 0
+    exhausted = False
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
-    while len(data) < target_data_size:
-        while state.remaining_batch_size < target_data_size:
-            # get samples from the buffer and submit the generation requests.
-            samples = data_source(args.over_sampling_batch_size)
-            _annotate_rollout_groups(args, samples, rollout_id, evaluation=False)
-            state.submit_generate_tasks(samples)
+    try:
+        while len(data) < target_data_size:
+            while state.remaining_batch_size < target_data_size:
+                if max_groups is not None and submitted_groups >= max_groups:
+                    exhausted = True
+                    break
 
-        # wait for the generation to finish
-        done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            group: list[Sample] = task.result()
+                # get samples from the buffer and submit the generation requests.
+                fetch_size = args.over_sampling_batch_size
+                if max_groups is not None:
+                    fetch_size = min(fetch_size, max_groups - submitted_groups)
+                if fetch_size <= 0:
+                    exhausted = True
+                    break
 
-            if do_print:
-                sample = group[0][0] if isinstance(group[0], list) else group[0]
-                logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+                samples = data_source(fetch_size)
+                if not samples:
+                    reason = "dynamic sampling data source returned no groups"
+                    details = _format_dynamic_sampling_state(
+                        rollout_id=rollout_id,
+                        target_data_size=target_data_size,
+                        submitted_groups=submitted_groups,
+                        completed_groups=completed_groups,
+                        kept_groups=kept_groups,
+                        dropped_groups=dropped_groups,
+                        removed_groups=removed_groups,
+                        failed_groups=failed_groups,
+                        failed_samples=failed_samples,
+                        removed_samples=removed_samples,
+                        pending_groups=len(state.pendings),
+                        max_groups=max_groups,
+                        max_seconds=max_seconds,
+                        failed_group_abort_min_groups=failed_group_abort_min_groups,
+                        failed_group_abort_ratio=failed_group_abort_ratio,
+                    )
+                    raise RuntimeError(f"{reason}: {details}")
+                _annotate_rollout_groups(args, samples, rollout_id, evaluation=False)
+                state.submit_generate_tasks(samples)
+                submitted_groups += len(samples)
+
+            if len(data) >= target_data_size:
+                break
+
+            if not state.pendings:
+                reason = "dynamic sampling exhausted before collecting enough kept groups"
+                details = _format_dynamic_sampling_state(
+                    rollout_id=rollout_id,
+                    target_data_size=target_data_size,
+                    submitted_groups=submitted_groups,
+                    completed_groups=completed_groups,
+                    kept_groups=kept_groups,
+                    dropped_groups=dropped_groups,
+                    removed_groups=removed_groups,
+                    failed_groups=failed_groups,
+                    failed_samples=failed_samples,
+                    removed_samples=removed_samples,
+                    pending_groups=0,
+                    max_groups=max_groups,
+                    max_seconds=max_seconds,
+                    failed_group_abort_min_groups=failed_group_abort_min_groups,
+                    failed_group_abort_ratio=failed_group_abort_ratio,
                 )
-                do_print = False
+                raise RuntimeError(f"{reason}: {details}")
 
-            assert len(group) == args.n_samples_per_prompt
-            all_data.append(group)
-            dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
-            if not dynamic_filter_output.keep:
-                metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
-                state.remaining_batch_size -= 1
-                continue
+            timeout = None
+            if deadline is not None:
+                timeout = max(0.0, deadline - time.monotonic())
+            done, state.pendings = await asyncio.wait(
+                state.pendings,
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                reason = "dynamic sampling timed out before collecting enough kept groups"
+                details = _format_dynamic_sampling_state(
+                    rollout_id=rollout_id,
+                    target_data_size=target_data_size,
+                    submitted_groups=submitted_groups,
+                    completed_groups=completed_groups,
+                    kept_groups=kept_groups,
+                    dropped_groups=dropped_groups,
+                    removed_groups=removed_groups,
+                    failed_groups=failed_groups,
+                    failed_samples=failed_samples,
+                    removed_samples=removed_samples,
+                    pending_groups=len(state.pendings),
+                    max_groups=max_groups,
+                    max_seconds=max_seconds,
+                    failed_group_abort_min_groups=failed_group_abort_min_groups,
+                    failed_group_abort_ratio=failed_group_abort_ratio,
+                )
+                raise RuntimeError(f"{reason}: {details}")
 
-            # add the samples to the data
-            # NOTE: here we have not stored all the unused samples back to the data buffer.
-            if len(data) < target_data_size:
-                data.append(group)
-                pbar.update(args.n_samples_per_prompt)
+            for task in done:
+                group: list[Sample] = task.result()
+                completed_groups += 1
+
+                if do_print:
+                    sample = group[0][0] if isinstance(group[0], list) else group[0]
+                    logger.info(
+                        f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+                    )
+                    do_print = False
+
+                stats = _group_sample_stats(group)
+                removed_groups += stats["all_removed"]
+                failed_groups += stats["all_failed"]
+                removed_samples += stats["removed"]
+                failed_samples += stats["failed"]
+
+                assert len(group) == args.n_samples_per_prompt
+                all_data.append(group)
+                dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
+                if not dynamic_filter_output.keep:
+                    dropped_groups += 1
+                    metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
+                    state.remaining_batch_size -= 1
+                    continue
+
+                # add the samples to the data
+                # NOTE: here we have not stored all the unused samples back to the data buffer.
+                if len(data) < target_data_size:
+                    data.append(group)
+                    kept_groups += 1
+                    pbar.update(args.n_samples_per_prompt)
+
+            if _should_abort_for_failed_rollout_groups(
+                completed_groups=completed_groups,
+                kept_groups=kept_groups,
+                failed_groups=failed_groups,
+                min_groups=failed_group_abort_min_groups,
+                ratio=failed_group_abort_ratio,
+            ):
+                reason = "dynamic sampling aborted after repeated all-failed rollout groups"
+                details = _format_dynamic_sampling_state(
+                    rollout_id=rollout_id,
+                    target_data_size=target_data_size,
+                    submitted_groups=submitted_groups,
+                    completed_groups=completed_groups,
+                    kept_groups=kept_groups,
+                    dropped_groups=dropped_groups,
+                    removed_groups=removed_groups,
+                    failed_groups=failed_groups,
+                    failed_samples=failed_samples,
+                    removed_samples=removed_samples,
+                    pending_groups=len(state.pendings),
+                    max_groups=max_groups,
+                    max_seconds=max_seconds,
+                    failed_group_abort_min_groups=failed_group_abort_min_groups,
+                    failed_group_abort_ratio=failed_group_abort_ratio,
+                )
+                raise RuntimeError(f"{reason}: {details}")
+
+            if exhausted and len(data) < target_data_size and not state.pendings:
+                reason = "dynamic sampling reached max groups before collecting enough kept groups"
+                details = _format_dynamic_sampling_state(
+                    rollout_id=rollout_id,
+                    target_data_size=target_data_size,
+                    submitted_groups=submitted_groups,
+                    completed_groups=completed_groups,
+                    kept_groups=kept_groups,
+                    dropped_groups=dropped_groups,
+                    removed_groups=removed_groups,
+                    failed_groups=failed_groups,
+                    failed_samples=failed_samples,
+                    removed_samples=removed_samples,
+                    pending_groups=0,
+                    max_groups=max_groups,
+                    max_seconds=max_seconds,
+                    failed_group_abort_min_groups=failed_group_abort_min_groups,
+                    failed_group_abort_ratio=failed_group_abort_ratio,
+                )
+                raise RuntimeError(f"{reason}: {details}")
+    except Exception:
+        pbar.close()
+        await _cancel_pending_generation_tasks(args, "dynamic sampling did not complete")
+        raise
 
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
@@ -445,7 +789,25 @@ async def generate_rollout_async(
         process_func = load_function(args.rollout_all_samples_process_path)
         process_func(args, all_samples, data_source)
 
-    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
+    metrics = metric_gatherer.collect()
+    metrics.update(
+        {
+            "rollout/dynamic_sampling/submitted_groups": submitted_groups,
+            "rollout/dynamic_sampling/completed_groups": completed_groups,
+            "rollout/dynamic_sampling/kept_groups": kept_groups,
+            "rollout/dynamic_sampling/dropped_groups": dropped_groups,
+            "rollout/dynamic_sampling/removed_groups": removed_groups,
+            "rollout/dynamic_sampling/failed_groups": failed_groups,
+            "rollout/dynamic_sampling/removed_samples": removed_samples,
+            "rollout/dynamic_sampling/failed_samples": failed_samples,
+            "rollout/dynamic_sampling/max_groups": max_groups or 0,
+            "rollout/dynamic_sampling/max_seconds": max_seconds or 0,
+            "rollout/dynamic_sampling/failed_group_abort_min_groups": failed_group_abort_min_groups or 0,
+            "rollout/dynamic_sampling/failed_group_abort_ratio": failed_group_abort_ratio,
+        }
+    )
+
+    return RolloutFnTrainOutput(samples=data, metrics=metrics), aborted_samples
 
 
 EVAL_PROMPT_DATASET = {}
@@ -509,6 +871,31 @@ async def eval_rollout_single_dataset(
         spaces_between_special_tokens=False,
     )
 
+    eval_max_concurrency = int(
+        os.getenv("EVAL_ROLLOUT_MAX_CONCURRENCY", "0") or 0
+    )
+    eval_semaphore = (
+        asyncio.Semaphore(eval_max_concurrency) if eval_max_concurrency > 0 else None
+    )
+
+    async def _generate_eval_sample(
+        sample: Sample, sampling_params: dict[str, Any]
+    ) -> list[Sample]:
+        if eval_semaphore is None:
+            return await generate_and_rm(
+                args,
+                sample,
+                sampling_params=sampling_params,
+                evaluation=True,
+            )
+        async with eval_semaphore:
+            return await generate_and_rm(
+                args,
+                sample,
+                sampling_params=sampling_params,
+                evaluation=True,
+            )
+
     tasks = []
     # do multiple samples for eval prompts
     sample_index = 0
@@ -527,12 +914,7 @@ async def eval_rollout_single_dataset(
                 sampling_params["sampling_seed"] = args.rollout_seed + j
             tasks.append(
                 asyncio.create_task(
-                    generate_and_rm(
-                        args,
-                        sample,
-                        sampling_params=sampling_params,
-                        evaluation=True,
-                    )
+                    _generate_eval_sample(sample, sampling_params=sampling_params)
                 )
             )
 
@@ -542,10 +924,14 @@ async def eval_rollout_single_dataset(
     for coro in asyncio.as_completed(tasks):
         sample = await coro
         if do_print:
+            example_sample = sample[0] if isinstance(sample, list) and sample else sample
+            example_prompt = getattr(example_sample, "prompt", "<empty sample>")
+            example_response = getattr(example_sample, "response", "") or ""
+            example_reward = getattr(example_sample, "reward", None)
             logger.info(
                 "eval_rollout_single_dataset example data: "
-                f"{[str(sample.prompt) + sample.response]} "
-                f"reward={sample.reward}"
+                f"{[str(example_prompt) + example_response]} "
+                f"reward={example_reward}"
             )
             do_print = False
         if isinstance(sample, list):
