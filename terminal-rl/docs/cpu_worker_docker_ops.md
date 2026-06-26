@@ -29,6 +29,9 @@ CPU worker 负责运行 `pool_server`，由它管理 Docker 容器并执行 seta
 | `terminal-rl/remote/prebuild_proxied_base_images.sh` | 给常用 base image 注入 apt proxy |
 | `terminal-rl/remote/diag_docker_failures_lite.sh` | 训练期间可运行的轻量诊断 |
 | `terminal-rl/remote/cleanup_docker_cache.sh` | 清理 stopped containers、build cache、dangling volumes/networks |
+| `terminal-rl/remote/safevo_docker_storage_doctor.sh` | safevo/rlinfra Docker data-root 深度诊断：区分 overlay2 image layer、container writable layer、BuildKit/orphan、json log，并支持保守修复 |
+| `terminal-rl/remote/docker_overlay2_orphan_audit.py` | overlay2 离线可达性审计：从 layerdb 出发沿 lower 链找不可达目录，支持停 Docker 后 quarantine 回滚式处理 |
+| `terminal-rl/remote/docker_storage_gc.py` | Docker data-root 自动 GC：阈值触发、dry-run、保留白名单、按旧 image 逐个删除直到目标水位 |
 
 前置要求：
 
@@ -251,6 +254,107 @@ sudo env DOCKER_DATA_ROOT=/data bash terminal-rl/remote/restart_docker_force.sh
 bash terminal-rl/remote/cleanup_docker_cache.sh
 ```
 
+如果 Docker data root 已接近打满且 `cleanup_docker_cache.sh` 无法释放足够空间，先做只读诊断：
+
+```bash
+DOCKER_DATA_ROOT=/data \
+python3 terminal-rl/remote/docker_storage_gc.py --diagnose-only
+```
+
+如果需要解释 `/data/overlay2` 到底由 image layer、container writable layer、BuildKit cache 还是 Docker json log 贡献，优先运行 doctor 脚本。默认只读，不删除任何对象：
+
+```bash
+DOCKER_DATA_ROOT=/data \
+bash terminal-rl/remote/safevo_docker_storage_doctor.sh
+```
+
+如果 `/data/overlay2` 目录很多、全量 `du` 太慢，可以跳过全量扫描，只做抽样：
+
+```bash
+DOCKER_DATA_ROOT=/data RUN_OVERLAY_DU=0 RUN_OVERLAY_SAMPLE=1 OVERLAY_SAMPLE_N=200 \
+bash terminal-rl/remote/safevo_docker_storage_doctor.sh
+```
+
+如需预览保守修复动作：
+
+```bash
+MODE=repair APPLY=0 DOCKER_DATA_ROOT=/data \
+bash terminal-rl/remote/safevo_docker_storage_doctor.sh
+```
+
+确认后执行保守修复。该模式不会删除已 tag 的 image，只清理 stopped container、unused network、旧 builder cache、dangling image；volume 和日志截断仍需单独打开：
+
+```bash
+MODE=repair APPLY=1 DOCKER_DATA_ROOT=/data \
+bash terminal-rl/remote/safevo_docker_storage_doctor.sh
+```
+
+如确认当前没有 build/pull 任务，并且希望优先释放非 image 的构建缓存，可只把 builder cache 全清，仍不删除 tagged image：
+
+```bash
+MODE=repair APPLY=1 DOCKER_DATA_ROOT=/data BUILDER_CACHE_UNTIL=all PRUNE_TIMEOUT=900 \
+bash terminal-rl/remote/safevo_docker_storage_doctor.sh
+```
+
+如果清理后 Docker 账本和文件系统仍明显对不上，并且 doctor 显示大量 overlay2 目录无法从 layerdb/lower 链到达，先做只读 orphan 审计：
+
+```bash
+DOCKER_DATA_ROOT=/data \
+python3 terminal-rl/remote/docker_overlay2_orphan_audit.py --docker-root /data --top-n 80
+```
+
+只有在确认 pool_server/watchdog/Docker 都停掉之后，才允许把候选目录移动到 quarantine。该步骤不是删除，便于回滚：
+
+```bash
+systemctl stop docker-watchdog || true
+pkill -f run_pool_server_pu_v2.sh || true
+systemctl stop docker
+
+python3 terminal-rl/remote/docker_overlay2_orphan_audit.py \
+  --docker-root /data \
+  --quarantine \
+  --quarantine-dir /data/overlay2.orphan-quarantine.$(date +%Y%m%d_%H%M%S)
+
+systemctl start docker
+df -h /data
+docker info
+```
+
+如果 Docker 启动或 image/build 验证失败，停 Docker 后将 quarantine 目录里的 `overlay2/*` 和 `l/*` 移回 `/data/overlay2/` 即可回滚。
+
+如需更重的统计，再显式打开慢操作；`docker system df -v` 和 `du` 在 layer 很多时可能较慢：
+
+```bash
+DOCKER_DATA_ROOT=/data \
+python3 terminal-rl/remote/docker_storage_gc.py --diagnose-only --run-docker-df --run-du
+```
+
+注意：`/data/overlay2` 是 Docker overlay2 storage driver 的核心目录，image layer、build cache 关联 layer、container writable layer 都可能落在这里。看到 overlay2 占比大不等于可以直接删 overlay2 子目录；在线手删 overlay2 很容易破坏 Docker 元数据。
+
+默认 GC 不删除已 tag 的旧 image，只会清理 stopped containers、dangling volumes、dangling images、builder cache。预览旧 image 候选：
+
+```bash
+DOCKER_DATA_ROOT=/data \
+DOCKER_GC_DRY_RUN=1 \
+DOCKER_GC_TRIGGER_USED_PCT=85 \
+DOCKER_GC_TARGET_USED_PCT=70 \
+DOCKER_GC_KEEP_PATTERNS='ghcr.io/laude-institute/t-bench/*,ubuntu:*,python:*' \
+python3 terminal-rl/remote/docker_storage_gc.py
+```
+
+确认确实需要删除旧 image 后，必须显式开启：
+
+```bash
+DOCKER_DATA_ROOT=/data \
+DOCKER_GC_TRIGGER_USED_PCT=85 \
+DOCKER_GC_TARGET_USED_PCT=70 \
+DOCKER_GC_DELETE_OLD_IMAGES=1 \
+DOCKER_GC_KEEP_PATTERNS='ghcr.io/laude-institute/t-bench/*,ubuntu:*,python:*' \
+python3 terminal-rl/remote/docker_storage_gc.py
+```
+
+该脚本不会删除任何仍被 Docker container 引用的 image；默认还会保护匹配白名单的基础镜像。开启 `DOCKER_GC_DELETE_OLD_IMAGES=1` 后，它才会按 image created time 从旧到新删除未引用 image，到目标水位即停止。
+
 如果日志里明确出现 `/data/overlay2/... no space left on device`：
 
 ```bash
@@ -390,6 +494,14 @@ mkdir /data/overlay2/<id>: no space left on device
 
 ```bash
 cd /mnt/shared-storage-user/puyuan/code/OpenClaw-RL
+
+# 先判因：默认只读，报告写到 tmp_doc_latest/docker_storage_doctor/<host>/<run_id>/
+DOCKER_DATA_ROOT=/data bash terminal-rl/remote/safevo_docker_storage_doctor.sh
+
+# 再做保守修复：不删除 tagged images
+MODE=repair APPLY=1 DOCKER_DATA_ROOT=/data bash terminal-rl/remote/safevo_docker_storage_doctor.sh
+
+# 如果已经确认可以删除所有未引用 image，再使用旧 emergency 脚本的 AGGRESSIVE 模式
 AGGRESSIVE=1 bash terminal-rl/remote/fix_docker_overlay2_no_space.sh
 ```
 
@@ -405,13 +517,73 @@ DISK_INODE_WARN_PCT=80
 DISK_INODE_EMERGENCY_PCT=90
 DISK_BUILD_CACHE_UNTIL=12h
 WATCHDOG_AGGRESSIVE_IMAGE_PRUNE=0
+WATCHDOG_DOCKER_STORAGE_GC=1
+DOCKER_GC_TRIGGER_USED_PCT=85
+DOCKER_GC_TARGET_USED_PCT=70
+DOCKER_GC_DELETE_OLD_IMAGES=0
+DOCKER_GC_KEEP_PATTERNS='ghcr.io/laude-institute/t-bench/*,ubuntu:*,python:*'
 POOL_STOP_ON_DISK_EMERGENCY=1
 ```
 
-如果 worker 磁盘较小且允许自动删除未使用 image，可在 watchdog 环境中设置：
+如果 worker 磁盘较小且允许自动删除未使用 image，推荐保留 `WATCHDOG_DOCKER_STORAGE_GC=1`。旧的无差别 unused-image prune 仍可通过以下方式启用，但不推荐作为默认：
 
 ```bash
+WATCHDOG_DOCKER_STORAGE_GC=0
 WATCHDOG_AGGRESSIVE_IMAGE_PRUNE=1
+```
+
+safevo/rlinfra 可共用同一脚本，仅通过阈值区分。safevo 900G 更容易触顶，建议更早触发；rlinfra 1T 可使用相同或略宽松阈值：
+
+```bash
+# safevo
+DOCKER_DATA_ROOT=/data
+DOCKER_GC_TRIGGER_USED_PCT=85
+DOCKER_GC_TARGET_USED_PCT=70
+DOCKER_GC_MIN_FREE_GB=120
+DOCKER_GC_DELETE_OLD_IMAGES=0
+
+# rlinfra
+DOCKER_DATA_ROOT=/data
+DOCKER_GC_TRIGGER_USED_PCT=88
+DOCKER_GC_TARGET_USED_PCT=75
+DOCKER_GC_MIN_FREE_GB=100
+DOCKER_GC_DELETE_OLD_IMAGES=0
+```
+
+也可以用 cron 做独立巡检，和 watchdog 互补：
+
+```cron
+*/15 * * * * cd /mnt/shared-storage-user/puyuan/code/OpenClaw-RL && DOCKER_DATA_ROOT=/data DOCKER_GC_TRIGGER_USED_PCT=85 DOCKER_GC_TARGET_USED_PCT=70 DOCKER_GC_LOG_FILE=/var/log/openclaw-docker-gc.log python3 terminal-rl/remote/docker_storage_gc.py
+```
+
+systemd timer 示例：
+
+```ini
+# /etc/systemd/system/openclaw-docker-gc.service
+[Unit]
+Description=OpenClaw Docker storage GC
+
+[Service]
+Type=oneshot
+WorkingDirectory=/mnt/shared-storage-user/puyuan/code/OpenClaw-RL
+Environment=DOCKER_DATA_ROOT=/data
+Environment=DOCKER_GC_TRIGGER_USED_PCT=85
+Environment=DOCKER_GC_TARGET_USED_PCT=70
+Environment=DOCKER_GC_DELETE_OLD_IMAGES=0
+Environment=DOCKER_GC_KEEP_PATTERNS=ghcr.io/laude-institute/t-bench/*,ubuntu:*,python:*
+ExecStart=/usr/bin/python3 terminal-rl/remote/docker_storage_gc.py
+
+# /etc/systemd/system/openclaw-docker-gc.timer
+[Unit]
+Description=Run OpenClaw Docker storage GC periodically
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Unit=openclaw-docker-gc.service
+
+[Install]
+WantedBy=timers.target
 ```
 
 新版 `pool_server` 也会在 `/allocate` 和 `/reset` 前做 Docker data-root admission check。默认阈值：

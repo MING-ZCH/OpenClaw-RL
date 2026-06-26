@@ -31,6 +31,9 @@
 #   DOCKER_DATA_ROOT  default: /data. DOCKER_ROOT is accepted as legacy alias.
 #   START_WATCHDOG    1=auto-start watchdog at end (default), 0=leave stopped
 #   SKIP_VERIFY       1=skip seta_env/0 build test (default 0)
+#   DOCKER_START_WAIT_SECONDS  seconds to wait for dockerd API per attempt (default 300)
+#   FORCE_RESTART_CONTAINERD   1=restart containerd and clear runtime state in Phase 2 (default 1)
+#   DOCKER_RUNTIME_RETRY       1=retry dockerd once after runtime cleanup if first start hangs (default 1)
 #   SETA              path to seta_env/0/ (default: in this repo)
 
 set -uo pipefail
@@ -40,6 +43,10 @@ NO_PROXY_LIST="${NO_PROXY_LIST:-localhost,127.0.0.1,10.0.0.0/8,100.96.0.0/12,.pj
 DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-${DOCKER_ROOT:-/data}}"
 START_WATCHDOG="${START_WATCHDOG:-1}"
 SKIP_VERIFY="${SKIP_VERIFY:-0}"
+# DOCKER_START_WAIT_SECONDS="${DOCKER_START_WAIT_SECONDS:-300}"
+DOCKER_START_WAIT_SECONDS="${DOCKER_START_WAIT_SECONDS:-600}"
+FORCE_RESTART_CONTAINERD="${FORCE_RESTART_CONTAINERD:-1}"
+DOCKER_RUNTIME_RETRY="${DOCKER_RUNTIME_RETRY:-1}"
 SETA="${SETA:-/mnt/shared-storage-user/puyuan/code/OpenClaw-RL/terminal-rl/dataset/seta_env/0}"
 
 USERS_TO_CONFIGURE=("root")
@@ -59,8 +66,96 @@ log "  NO_PROXY_LIST     = ${NO_PROXY_LIST}"
 log "  DOCKER_DATA_ROOT  = ${DOCKER_DATA_ROOT}"
 log "  START_WATCHDOG    = ${START_WATCHDOG}"
 log "  SKIP_VERIFY       = ${SKIP_VERIFY}"
+log "  DOCKER_START_WAIT = ${DOCKER_START_WAIT_SECONDS}s"
+log "  RESTART_CONTAINERD= ${FORCE_RESTART_CONTAINERD}"
+log "  RUNTIME_RETRY     = ${DOCKER_RUNTIME_RETRY}"
 log "  USERS             = ${USERS_TO_CONFIGURE[*]}"
 hr
+
+dump_docker_start_diagnostics() {
+  local log_file="${1:-}"
+  log "  diagnostics: dockerd/containerd process state"
+  pgrep -a -x dockerd 2>/dev/null | sed 's/^/    /' || true
+  pgrep -a -x containerd 2>/dev/null | sed 's/^/    /' || true
+  pgrep -a -f containerd-shim 2>/dev/null | head -20 | sed 's/^/    /' || true
+  if [ -n "${log_file}" ] && [ -f "${log_file}" ]; then
+    log "  dockerd log tail (${log_file}):"
+    tail -80 "${log_file}" 2>/dev/null | sed 's/^/    /' || true
+  fi
+  log "  journal docker tail:"
+  journalctl -u docker -n 80 --no-pager 2>/dev/null | sed 's/^/    /' || true
+  log "  journal containerd tail:"
+  journalctl -u containerd -n 80 --no-pager 2>/dev/null | sed 's/^/    /' || true
+}
+
+cleanup_docker_runtime_state() {
+  log "  cleaning Docker runtime state under /run (not Docker data-root layers/images)"
+  rm -f /var/run/docker.pid /var/run/docker.sock
+  rm -rf /run/docker 2>/dev/null || true
+  rm -rf /run/containerd/io.containerd.runtime.v2.task/moby 2>/dev/null || true
+  rm -rf /run/containerd/io.containerd.grpc.v1.introspection 2>/dev/null || true
+}
+
+restart_containerd_clean() {
+  if [ "${FORCE_RESTART_CONTAINERD}" != "1" ]; then
+    if ! pgrep -x containerd >/dev/null 2>&1; then
+      log "  containerd not running, starting via systemd ..."
+      timeout 10 systemctl start containerd 2>/dev/null || \
+        log "  WARN: systemctl start containerd timed out"
+      sleep 3
+    fi
+    return 0
+  fi
+
+  log "  restarting containerd cleanly after shim cleanup"
+  timeout 10 systemctl stop containerd 2>/dev/null || log "  WARN: systemctl stop containerd timed out"
+  pkill -9 -x containerd 2>/dev/null || true
+  cleanup_docker_runtime_state
+  timeout 20 systemctl start containerd 2>/dev/null || log "  WARN: systemctl start containerd timed out"
+  sleep 3
+  if pgrep -x containerd >/dev/null 2>&1; then
+    log "  [OK] containerd running: $(pgrep -x containerd | xargs)"
+  else
+    log "  WARN: containerd still not visible after restart"
+  fi
+}
+
+start_dockerd_direct() {
+  LOG_FILE="/tmp/dockerd_fix_$(date +%H%M%S).log"
+  export HTTP_PROXY="${PROXY_URL}" HTTPS_PROXY="${PROXY_URL}" NO_PROXY="${NO_PROXY_LIST}"
+  export http_proxy="${PROXY_URL}" https_proxy="${PROXY_URL}" no_proxy="${NO_PROXY_LIST}"
+  nohup dockerd --containerd=/run/containerd/containerd.sock > "${LOG_FILE}" 2>&1 &
+  DOCKERD_PID=$!
+  disown 2>/dev/null || true
+  log "  nohup started dockerd PID=${DOCKERD_PID}, log: ${LOG_FILE}"
+}
+
+wait_for_dockerd_api() {
+  local label="$1"
+  local max_attempts=$((DOCKER_START_WAIT_SECONDS / 5))
+  local i
+  [ "${max_attempts}" -gt 0 ] 2>/dev/null || max_attempts=60
+  log "  waiting for dockerd API (${label}, up to ${DOCKER_START_WAIT_SECONDS}s) ..."
+  for i in $(seq 1 "${max_attempts}"); do
+    if timeout 10 docker info >/dev/null 2>&1; then
+      log "  [OK] dockerd API ready after ~$((i*5))s (${label})"
+      return 0
+    fi
+    if ! pgrep -x dockerd >/dev/null 2>&1; then
+      log "  [ERROR] dockerd process died during startup (${label})"
+      dump_docker_start_diagnostics "${LOG_FILE:-}"
+      return 1
+    fi
+    if [ $((i % 6)) -eq 0 ]; then
+      log "    still waiting ... (~$((i*5))s elapsed, ${label})"
+      [ -n "${LOG_FILE:-}" ] && tail -3 "${LOG_FILE}" 2>/dev/null | sed 's/^/      /' || true
+    fi
+    sleep 5
+  done
+  log "  [ERROR] dockerd not ready after ${DOCKER_START_WAIT_SECONDS}s (${label})"
+  dump_docker_start_diagnostics "${LOG_FILE:-}"
+  return 1
+}
 
 # ─── Phase 0: pre-flight ─────────────────────────────────────────────
 log "Phase 0: pre-flight (proxy reachability)"
@@ -121,13 +216,8 @@ if [ -d "${DOCKER_DATA_ROOT}/containers" ]; then
 fi
 rm -f "${DOCKER_DATA_ROOT}/network/files/local-kv.db" 2>/dev/null || true
 
-# 2d. Ensure containerd is running
-if ! pgrep -x containerd >/dev/null 2>&1; then
-  log "  containerd not running, starting via systemd ..."
-  timeout 10 systemctl start containerd 2>/dev/null || \
-    log "  WARN: systemctl start containerd timed out"
-  sleep 3
-fi
+# 2d. Restart containerd and clear stale runtime task state.
+restart_containerd_clean
 log "  [OK] phase 2 complete"
 
 # ─── Phase 3: write proxy configs ────────────────────────────────────
@@ -217,39 +307,24 @@ if timeout 90 systemctl start docker 2>&1 | sed 's/^/  /'; then
   log "  [OK] systemctl start docker returned"
 else
   log "  WARN: systemctl start docker failed; falling back to direct nohup"
-  LOG_FILE="/tmp/dockerd_fix_$(date +%H%M%S).log"
-  export HTTP_PROXY="${PROXY_URL}" HTTPS_PROXY="${PROXY_URL}" NO_PROXY="${NO_PROXY_LIST}"
-  nohup dockerd --containerd=/run/containerd/containerd.sock > "${LOG_FILE}" 2>&1 &
-  disown 2>/dev/null || true
-  log "  nohup started, log: ${LOG_FILE}"
+  start_dockerd_direct
 fi
 
-# Wait for dockerd API
-log "  waiting for dockerd API (up to 5 min) ..."
-READY=0
-for i in $(seq 1 60); do
-  if timeout 5 docker info >/dev/null 2>&1; then
-    READY=1
-    log "  [OK] dockerd API ready after ~$((i*5))s"
-    break
-  fi
-  if ! pgrep -x dockerd >/dev/null 2>&1; then
-    log "  [ERROR] dockerd process died during startup"
-    if [ "${SYSTEMD_OK}" = "1" ]; then
-      log "  journalctl tail:"
-      journalctl -u docker -n 30 --no-pager 2>/dev/null | sed 's/^/    /' || true
-    else
-      log "  nohup log tail:"
-      tail -20 "${LOG_FILE:-/tmp/nohup.out}" 2>/dev/null | sed 's/^/    /' || true
+if ! wait_for_dockerd_api "initial start"; then
+  if [ "${DOCKER_RUNTIME_RETRY}" = "1" ]; then
+    log "Phase 4 retry: dockerd did not become ready; forcing runtime cleanup and retrying once"
+    pkill -9 -x dockerd 2>/dev/null || true
+    SHIM_PIDS=$(pgrep containerd-shim 2>/dev/null || true)
+    if [ -n "${SHIM_PIDS}" ]; then
+      log "  retry cleanup: killing $(echo "${SHIM_PIDS}" | wc -l) remaining containerd-shim"
+      echo "${SHIM_PIDS}" | xargs -r kill -9 2>/dev/null || true
     fi
+    restart_containerd_clean
+    start_dockerd_direct
+    wait_for_dockerd_api "runtime cleanup retry" || exit 3
+  else
     exit 3
   fi
-  [ $((i % 6)) -eq 0 ] && log "    still waiting ... (~$((i*5))s elapsed)"
-  sleep 5
-done
-if [ "${READY}" != "1" ]; then
-  log "  [ERROR] dockerd not ready after 5 minutes"
-  exit 3
 fi
 
 # ─── Phase 5: verify dockerd has proxy env ───────────────────────────

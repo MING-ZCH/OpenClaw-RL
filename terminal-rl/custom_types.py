@@ -82,3 +82,4 @@ class TurnResult:
     tool_call_requests: List[Any]
     parse_error_recorded: bool
     terminated_response: Optional[Any] = None
+    interactions: Optional[List[Interaction]] = None

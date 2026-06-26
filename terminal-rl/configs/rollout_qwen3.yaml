@@ -1,4 +1,5 @@
 tool_call_parser: qwen25
 model_type: Qwen3
+harness_option: camel-agent
 max_iteration: 10
 trajectory_save_interval: 1

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 from copy import deepcopy
@@ -33,6 +34,9 @@ except ImportError:
         safe_int,
         tool_call_success_count,
     )
+
+
+logger = logging.getLogger(__name__)
 
 
 class AgentSafetyBenchEnv:
@@ -159,7 +163,19 @@ class AgentSafetyBenchEnv:
                 continue
             if not env.has_tool(name):
                 continue
-            result = env.call_tool(name, deepcopy(arguments or {}))
+            try:
+                result = env.call_tool(name, deepcopy(arguments or {}))
+            except Exception as exc:
+                logger.warning(
+                    "Agent-SafetyBench tool %s failed: %s",
+                    name,
+                    exc,
+                    exc_info=True,
+                )
+                result = {
+                    "success": False,
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
             return json.dumps(result, ensure_ascii=False)
         return json.dumps(
             {"success": False, "message": f"Tool {name} doesn't exist."},

@@ -30,6 +30,7 @@ fi
 
 TRAIN_LOG="${TRAIN_LOG:-}"
 OUT_DIR="${OUT_DIR:-}"
+RUNS_ROOT="${RUNS_ROOT:-${REPO_ROOT}/runs}"
 POOL_HOST="${POOL_HOST:-127.0.0.1}"
 POOL_PORT="${POOL_PORT:-18081}"
 DOCKER_DATA_ROOT="${DOCKER_DATA_ROOT:-${DOCKER_ROOT:-/data}}"
@@ -111,7 +112,20 @@ esac
 
 TS="$(date '+%Y%m%d_%H%M%S')"
 if [ -z "${OUT_DIR}" ]; then
-  OUT_DIR="${REPO_ROOT}/tmp_doc_latest/docker_worker_doctor_${TS}"
+  if [ -n "${RUN_DIR:-}" ]; then
+    OUT_DIR="${RUN_DIR}/diagnostics/docker_worker_doctor_${TS}"
+  elif [ -n "${RUN_ID:-}" ]; then
+    OUT_DIR="${RUNS_ROOT}/${RUN_ID}/diagnostics/docker_worker_doctor_${TS}"
+  elif [[ -n "${TRAIN_LOG}" && "${TRAIN_LOG}" == "${RUNS_ROOT}/"*"/logs/train.log" ]]; then
+    TRAIN_RUN_DIR="$(cd -- "$(dirname -- "${TRAIN_LOG}")/.." 2>/dev/null && pwd -P || true)"
+    if [ -n "${TRAIN_RUN_DIR}" ]; then
+      OUT_DIR="${TRAIN_RUN_DIR}/diagnostics/docker_worker_doctor_${TS}"
+    else
+      OUT_DIR="${RUNS_ROOT}/diagnostics/docker_worker_doctor_${TS}"
+    fi
+  else
+    OUT_DIR="${RUNS_ROOT}/diagnostics/docker_worker_doctor_${TS}"
+  fi
 fi
 mkdir -p "${OUT_DIR}"
 SUMMARY="${OUT_DIR}/SUMMARY.md"

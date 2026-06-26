@@ -6,6 +6,7 @@ swe.pem
 __pycache__/
 *.pyc
 logs
+/runs/
 .DS_Store
 docs/
 a3s-code-adapter/docs/

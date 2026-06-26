@@ -76,6 +76,52 @@ bash terminal-rl/terminal_qwen3_8b_rl.sh
 
 ---
 
+### Qwen3-8B eval-only on puyuan 集群
+
+在 4-GPU 节点上从 `/mnt/shared-storage-user/puyuan/code/OpenClaw-RL` 运行以下命令。`mock` suite 会评测 AgentSafetyBench train 和 AgentHarm val，并使用本地 mock env，因此不需要 Docker worker。
+
+```bash
+EVAL_SUITE=mock EVAL_CKPT=init \
+  bash terminal-rl/terminal-rl_qwen3-8b_eval_pu.sh
+
+EVAL_SUITE=mock EVAL_CKPT=step119 \
+  bash terminal-rl/terminal-rl_qwen3-8b_eval_pu.sh
+```
+
+使用每个 dataset 两条样本做 smoke test：
+
+```bash
+EVAL_SUITE=mock EVAL_CKPT=init EVAL_LIMIT=2 \
+  bash terminal-rl/terminal-rl_qwen3-8b_eval_pu.sh
+```
+
+Docker worker ready 后运行 SETA：
+
+```bash
+EVAL_SUITE=seta EVAL_CKPT=init WORKER_URLS=http://<worker-host>:18081 \
+  bash terminal-rl/terminal-rl_qwen3-8b_eval_pu.sh
+
+EVAL_SUITE=seta EVAL_CKPT=step119 WORKER_URLS=http://<worker-host>:18081 \
+  bash terminal-rl/terminal-rl_qwen3-8b_eval_pu.sh
+```
+
+SETA worker ready 后，也可以一次运行全部三个 benchmark：
+
+```bash
+EVAL_SUITE=all EVAL_CKPT=init WORKER_URLS=http://<worker-host>:18081 \
+  bash terminal-rl/terminal-rl_qwen3-8b_eval_pu.sh
+
+EVAL_SUITE=all EVAL_CKPT=step119 WORKER_URLS=http://<worker-host>:18081 \
+  bash terminal-rl/terminal-rl_qwen3-8b_eval_pu.sh
+```
+
+输出目录为 `runs/eval_qwen3-8b_<ckpt>_<suite>_<timestamp>/`。主要文件包括 `logs/eval.log`、`logs/ray_job.log`、`logs/metrics.jsonl`、`eval_summary.json` 和 `eval_summary.tsv`。在 summary 文件中，internal dataset label `security` 会被归一化为 `agent_safetybench`。
+
+当前 Qwen3-8B eval 完成状态和 score table 记录在：
+`terminal-rl/docs/qwen3_8b_eval_status_20260609.md`.
+
+---
+
 ### PRM training (optional)
 
 To enable PRM scoring with the 2-node script, add:

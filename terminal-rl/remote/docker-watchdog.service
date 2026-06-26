@@ -1,12 +1,12 @@
 [Unit]
 Description=Docker Watchdog for OpenClaw-RL pool_server (long-run hardened)
-Documentation=file:///mnt/shared-storage-user/puyuan/code/OpenClaw-RL/terminal-rl/remote/docker_watchdog_v2.sh
+Documentation=file:///mnt/shared-storage-user/puyuan/code/OpenClaw-RL/terminal-rl/remote/start_watchdog.sh
 After=docker.service network-online.target
 Wants=docker.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/bash /mnt/shared-storage-user/puyuan/code/OpenClaw-RL/terminal-rl/remote/docker_watchdog_v2.sh
+ExecStart=/usr/bin/bash /mnt/shared-storage-user/puyuan/code/OpenClaw-RL/terminal-rl/remote/start_watchdog.sh
 
 # Self-protection
 Restart=always
@@ -14,8 +14,8 @@ RestartSec=10
 TimeoutStopSec=15
 OOMScoreAdjust=-900
 
-# Logs go to journal AND a flat file via the script itself.
-# Don't double-rotate via journal here (we do truncate-in-place inside the script).
+# Logs go to journal and to a per-worker/per-run file via start_watchdog.sh.
+# Don't double-rotate via journal here (watchdog still truncates the target file).
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=docker-watchdog

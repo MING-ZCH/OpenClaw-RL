@@ -76,17 +76,28 @@ def build_record(sub_dir: Path, d: dict[str, Any], cls: str) -> dict[str, Any]:
     reward = d.get("reward", {})
     return {
         "dir": sub_dir.name,
+        "task_id": info.get("task_id"),
         "task_name": info.get("task_name"),
+        "task_path": info.get("task_path"),
+        "dataset_slug": info.get("dataset_slug") or info.get("data_source"),
         "uid": info.get("uid"),
         "group_index": info.get("group_index"),
         "sample_index": info.get("sample_index"),
+        "rollout_id": info.get("rollout_id"),
+        "train_step": info.get("train_step"),
         "status": str(info.get("status", "")).split(".")[-1],
         "num_turns": info.get("num_turns"),
         "accuracy": reward.get("accuracy"),
         "raw_score": reward.get("raw_score"),
         "base_score": reward.get("base_score"),
         "score": reward.get("score"),
+        "raw_reward": reward.get("raw_reward"),
+        "task_reward": reward.get("task_reward"),
+        "exploration_reward": reward.get("exploration_reward"),
+        "total_reward": reward.get("total_reward"),
         "safety_score": reward.get("safety_score"),
+        "trajectory_save_policy": info.get("trajectory_save_policy"),
+        "trajectory_save_reason": info.get("trajectory_save_reason"),
         "eval_error_short": (info.get("eval_error") or "").split("\n")[0][:200],
         "class": cls,
     }
@@ -109,6 +120,10 @@ def render_markdown(
     task_pass_count: Counter,
     tasks_with_any_pass: set,
     tasks_never_pass: set,
+    step_total: Counter,
+    tasks_with_multiple_steps: set,
+    policy_counter: Counter,
+    save_reason_counter: Counter,
     max_iter_hint: int,
 ) -> str:
     desc = dict(CLASS_DESCRIPTIONS)
@@ -123,7 +138,32 @@ def render_markdown(
         f"至少通过一次测试的 task：**{len(tasks_with_any_pass)}** / {len(task_total)}"
     )
     lines.append(f"从未通过的 task：**{len(tasks_never_pass)}** / {len(task_total)}")
+    lines.append(f"涉及不同 train_step/iter：**{len(step_total)}**")
+    lines.append(
+        f"保留了多个 iter 轨迹的 task：**{len(tasks_with_multiple_steps)}** / {len(task_total)}"
+    )
     lines.append("")
+    if step_total or policy_counter or save_reason_counter:
+        lines.append("## 留存覆盖")
+        lines.append("")
+        if step_total:
+            lines.append("**Top train_step 分布：**")
+            lines.append("")
+            for step, count in step_total.most_common(12):
+                lines.append(f"- `{step}`: {count}")
+            lines.append("")
+        if policy_counter:
+            lines.append("**Trajectory policy 分布：**")
+            lines.append("")
+            for policy, count in policy_counter.most_common():
+                lines.append(f"- `{policy}`: {count}")
+            lines.append("")
+        if save_reason_counter:
+            lines.append("**保存原因分布：**")
+            lines.append("")
+            for reason, count in save_reason_counter.most_common():
+                lines.append(f"- `{reason}`: {count}")
+            lines.append("")
     lines.append("## 分类统计")
     lines.append("")
     lines.append("| 类别 | 数量 | 占比 | 说明 |")
@@ -236,6 +276,35 @@ def render_markdown(
     return "\n".join(lines)
 
 
+def index_records_by_dir(traj_dir: Path) -> dict[Path, dict[str, Any]]:
+    index_path = traj_dir / "index.jsonl"
+    if not index_path.exists():
+        return {}
+    active: dict[str, dict[str, Any]] = {}
+    for line in index_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        rel_path = str(record.get("rel_path") or "")
+        if not rel_path:
+            continue
+        event = str(record.get("event") or "save")
+        if event == "delete":
+            active.pop(rel_path, None)
+        elif event == "save":
+            active[rel_path] = record
+
+    out: dict[Path, dict[str, Any]] = {}
+    for rel_path, record in active.items():
+        sub_dir = traj_dir / rel_path
+        if sub_dir.is_dir() and (sub_dir / "traj.json").exists():
+            out[sub_dir] = record
+    return out
+
+
 def analyze(
     run_dir: Path,
     traj_dir: Path | None = None,
@@ -256,9 +325,13 @@ def analyze(
 
     print(f"[+] scanning {traj_dir}")
     n = 0
+    indexed = index_records_by_dir(traj_dir)
+    candidate_dirs = list(indexed)
+    seen_dirs = set(candidate_dirs)
     for sub in sorted(traj_dir.iterdir()):
-        if not sub.is_dir():
-            continue
+        if sub.is_dir() and sub not in seen_dirs:
+            candidate_dirs.append(sub)
+    for sub in candidate_dirs:
         tj = sub / "traj.json"
         if not tj.exists():
             continue
@@ -289,13 +362,31 @@ def analyze(
 
     task_pass_count: Counter = Counter()
     task_total: Counter = Counter()
+    step_total: Counter = Counter()
+    task_step_total: Counter = Counter()
+    task_steps: dict[str, set[str]] = defaultdict(set)
+    policy_counter: Counter = Counter()
+    save_reason_counter: Counter = Counter()
     for rec in all_records:
         t = rec["task_name"]
         task_total[t] += 1
         if rec["class"] == "pass":
             task_pass_count[t] += 1
+        step = rec.get("train_step")
+        step_key = str(step if step is not None else "na")
+        step_total[step_key] += 1
+        task_step_total[(t, step_key)] += 1
+        task_steps[t].add(step_key)
+        if rec.get("trajectory_save_policy"):
+            policy_counter[str(rec["trajectory_save_policy"])] += 1
+        if rec.get("trajectory_save_reason"):
+            save_reason_counter[str(rec["trajectory_save_reason"])] += 1
     tasks_with_any_pass = {t for t in task_total if task_pass_count[t] > 0}
     tasks_never_pass = {t for t in task_total if task_pass_count[t] == 0}
+    tasks_with_multiple_steps = {
+        task for task, steps in task_steps.items()
+        if len({step for step in steps if step != "na"}) > 1
+    }
 
     report = {
         "run_dir": str(run_dir),
@@ -304,9 +395,18 @@ def analyze(
         "class_distribution": {k: len(v) for k, v in by_class.items()},
         "samples_per_class": sample_by_class,
         "n_unique_tasks": len(task_total),
+        "n_unique_train_steps": len(step_total),
+        "n_tasks_with_multiple_train_steps": len(tasks_with_multiple_steps),
         "n_tasks_with_at_least_one_pass": len(tasks_with_any_pass),
         "n_tasks_never_passed": len(tasks_never_pass),
         "top_passed_tasks": task_pass_count.most_common(20),
+        "top_train_steps": step_total.most_common(30),
+        "top_task_step_cells": [
+            {"task_name": task, "train_step": step, "count": count}
+            for (task, step), count in task_step_total.most_common(50)
+        ],
+        "trajectory_save_policy_distribution": dict(policy_counter),
+        "trajectory_save_reason_distribution": dict(save_reason_counter),
         "parse_errors": dict(err_counter),
     }
 
@@ -323,6 +423,10 @@ def analyze(
         task_pass_count=task_pass_count,
         tasks_with_any_pass=tasks_with_any_pass,
         tasks_never_pass=tasks_never_pass,
+        step_total=step_total,
+        tasks_with_multiple_steps=tasks_with_multiple_steps,
+        policy_counter=policy_counter,
+        save_reason_counter=save_reason_counter,
         max_iter_hint=max_iter_hint,
     )
     md_path = out_dir / "case_analysis.md"
@@ -339,6 +443,8 @@ def analyze(
         print(f"  {cls:24s}  {len(by_class.get(cls, [])):5d}")
     print(f"  unique tasks seen   {len(task_total):5d}")
     print(f"  tasks ever passed   {len(tasks_with_any_pass):5d}")
+    print(f"  unique train steps  {len(step_total):5d}")
+    print(f"  multi-step tasks    {len(tasks_with_multiple_steps):5d}")
 
     return report
 

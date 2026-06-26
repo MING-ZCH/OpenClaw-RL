@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -12,11 +15,64 @@ from terminal_bench.handlers.trial_handler import TrialHandler
 from terminal_bench.terminal.docker_compose_manager import DockerComposeManager
 from terminal_bench.terminal.terminal import Terminal
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class ImagePreparationResult:
     mode: Literal["build", "pull"]
     client_image_name: str | None = None
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+_MAX_CONCURRENT_BUILDS = _env_int("WORKER_MAX_CONCURRENT_BUILDS", 4)
+_BUILD_SEMAPHORE = threading.BoundedSemaphore(_MAX_CONCURRENT_BUILDS)
+_BUILD_LOCKS_GUARD = threading.Lock()
+_BUILD_LOCKS: dict[str, threading.Lock] = {}
+_BUILD_DONE: set[str] = set()
+_BUILD_FAILED: dict[str, tuple[float, str]] = {}
+_TASK_IMAGE_BLACKLISTED: dict[str, tuple[float, str]] = {}
+
+_DOCKERFILE_INSTRUCTION_RE = re.compile(
+    r"^\s*(?:ADD|ARG|CMD|COPY|ENTRYPOINT|ENV|EXPOSE|FROM|HEALTHCHECK|LABEL|"
+    r"MAINTAINER|ONBUILD|RUN|SHELL|STOPSIGNAL|USER|VOLUME|WORKDIR)\b",
+    re.IGNORECASE,
+)
+
+
+class DockerImageBuildError(RuntimeError):
+    """Deterministic task image build failure cached per task image."""
+
+
+class DockerImagePreparationBacklogError(RuntimeError):
+    """Transient image preparation backlog/cancellation before a build starts."""
+
+
+class TaskImageBlacklistedError(DockerImageBuildError):
+    """Task image is known-bad and should not hit Docker again until TTL expires."""
+
+
+_BUILD_STATE_GUARD = threading.Lock()
+_BUILD_ACTIVE = 0
+_BUILD_WAITING = 0
+_BUILD_BACKLOG_REJECTED = 0
+_BUILD_CANCELLED = 0
+
+
+def _safe_project_component(value: str, fallback: str = "task") -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip())
+    cleaned = cleaned.strip("-.")
+    return (cleaned or fallback)[:80]
 
 
 def _shorten_output(text: str | None, max_chars: int = 4000) -> str:
@@ -103,14 +159,247 @@ def _compose_plugin_maybe_missing(stderr: str | None) -> bool:
     )
 
 
-def build_docker_image(task: dict[str, Any], timeout: float = 1200.0) -> None:
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def docker_image_build_status() -> dict[str, int]:
+    with _BUILD_STATE_GUARD:
+        return {
+            "max_concurrent_builds": _MAX_CONCURRENT_BUILDS,
+            "active": _BUILD_ACTIVE,
+            "waiting": _BUILD_WAITING,
+            "backlog_rejected": _BUILD_BACKLOG_REJECTED,
+            "cancelled_before_build": _BUILD_CANCELLED,
+            "cached_done": len(_BUILD_DONE),
+            "cached_failed": len(_BUILD_FAILED),
+            "blacklisted": len(_TASK_IMAGE_BLACKLISTED),
+        }
+
+
+def _record_build_waiting(delta: int) -> None:
+    global _BUILD_WAITING
+    with _BUILD_STATE_GUARD:
+        _BUILD_WAITING = max(0, _BUILD_WAITING + delta)
+
+
+def _record_build_active(delta: int) -> None:
+    global _BUILD_ACTIVE
+    with _BUILD_STATE_GUARD:
+        _BUILD_ACTIVE = max(0, _BUILD_ACTIVE + delta)
+
+
+def _record_build_backlog_rejected() -> None:
+    global _BUILD_BACKLOG_REJECTED
+    with _BUILD_STATE_GUARD:
+        _BUILD_BACKLOG_REJECTED += 1
+
+
+def _record_build_cancelled() -> None:
+    global _BUILD_CANCELLED
+    with _BUILD_STATE_GUARD:
+        _BUILD_CANCELLED += 1
+
+
+def _cancel_event_is_set(cancel_event: threading.Event | None) -> bool:
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def _raise_if_cancelled(
+    cancel_event: threading.Event | None, *, build_key: str, stage: str
+) -> None:
+    if _cancel_event_is_set(cancel_event):
+        _record_build_cancelled()
+        raise DockerImagePreparationBacklogError(
+            f"DOCKER_IMAGE_PREP_CANCELLED image={build_key} stage={stage}"
+        )
+
+
+def _acquire_build_gate(
+    gate: threading.Lock | threading.BoundedSemaphore,
+    *,
+    build_key: str,
+    label: str,
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+) -> None:
+    poll = max(0.05, min(1.0, _env_float("WORKER_DOCKER_BUILD_QUEUE_POLL", 0.5)))
+    _record_build_waiting(1)
+    try:
+        while True:
+            _raise_if_cancelled(cancel_event, build_key=build_key, stage=f"wait_{label}")
+            timeout = poll
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _record_build_backlog_rejected()
+                    raise DockerImagePreparationBacklogError(
+                        f"DOCKER_IMAGE_PREP_BACKLOG image={build_key} "
+                        f"waiting_for={label} timeout={_build_queue_timeout():.1f}s"
+                    )
+                timeout = min(timeout, remaining)
+            if gate.acquire(timeout=timeout):
+                return
+    finally:
+        _record_build_waiting(-1)
+
+
+def _build_queue_timeout() -> float:
+    return _env_float("WORKER_DOCKER_BUILD_QUEUE_TIMEOUT", 90.0)
+
+
+def _build_failed_ttl() -> float:
+    raw = os.getenv("WORKER_DOCKER_BUILD_FAILED_TTL", "3600")
+    try:
+        value = float(raw)
+    except ValueError:
+        return 3600.0
+    return max(0.0, value)
+
+
+def _task_image_blacklist_ttl() -> float:
+    raw = os.getenv("WORKER_DOCKER_TASK_BLACKLIST_TTL", "86400")
+    try:
+        value = float(raw)
+    except ValueError:
+        return 86400.0
+    return max(0.0, value)
+
+
+def _cached_build_failure(build_key: str) -> str | None:
+    ttl = _build_failed_ttl()
+    if ttl <= 0:
+        return None
+    cached = _BUILD_FAILED.get(build_key)
+    if cached is None:
+        return None
+    ts, message = cached
+    if time.time() - ts <= ttl:
+        return message
+    _BUILD_FAILED.pop(build_key, None)
+    return None
+
+
+def _cached_task_image_blacklist(build_key: str) -> str | None:
+    ttl = _task_image_blacklist_ttl()
+    if ttl <= 0:
+        return None
+    cached = _TASK_IMAGE_BLACKLISTED.get(build_key)
+    if cached is None:
+        return None
+    ts, message = cached
+    if time.time() - ts <= ttl:
+        return message
+    _TASK_IMAGE_BLACKLISTED.pop(build_key, None)
+    return None
+
+
+def _blacklist_task_image(build_key: str, message: str) -> None:
+    if _task_image_blacklist_ttl() <= 0:
+        return
+    _TASK_IMAGE_BLACKLISTED[build_key] = (time.time(), message)
+
+
+def _is_deterministic_build_failure(message: str) -> bool:
+    lowered = message.lower()
+    deterministic_markers = (
+        "dockerfile parse error",
+        "unknown instruction:",
+        "failed to read dockerfile",
+        "cannot locate specified dockerfile",
+        "no such file or directory",
+        "yaml: line",
+        "services must be a mapping",
+    )
+    return any(marker in lowered for marker in deterministic_markers)
+
+
+def _dockerfile_precheck_error(task_path: Path) -> str | None:
+    if not _env_bool("WORKER_DOCKERFILE_PRECHECK", True):
+        return None
+    dockerfile = task_path / "Dockerfile"
+    try:
+        lines = dockerfile.read_text(encoding="utf-8", errors="replace").splitlines()
+    except FileNotFoundError:
+        return f"{dockerfile} is missing"
+    except OSError as exc:
+        return f"could not read {dockerfile}: {exc}"
+
+    current_instruction = ""
+    skip_heredoc_until: str | None = None
+    for idx, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if skip_heredoc_until is not None:
+            if stripped == skip_heredoc_until:
+                skip_heredoc_until = None
+            continue
+        match = _DOCKERFILE_INSTRUCTION_RE.match(line)
+        if match:
+            current_instruction = match.group(0).strip().split()[0].upper()
+        marker = re.search(r"<<\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?", line)
+        if marker is not None and current_instruction in {"ADD", "COPY"}:
+            skip_heredoc_until = marker.group(1)
+            continue
+        if "<<" not in line or current_instruction != "RUN":
+            if stripped and not line.rstrip().endswith("\\") and match:
+                current_instruction = ""
+            continue
+        run_body = re.sub(r"^\s*RUN\s+", "", line, flags=re.IGNORECASE).strip()
+        # Dockerfile heredoc syntax is `RUN <<EOF`; shell redirection heredocs
+        # such as `RUN cat > file <<EOF` are parsed as separate Dockerfile
+        # instructions on older/fronted-default builders and deterministically fail.
+        if run_body.startswith("<<"):
+            if marker is not None:
+                skip_heredoc_until = marker.group(1)
+            continue
+        if marker is None:
+            continue
+        return (
+            f"{dockerfile}:{idx} uses a shell heredoc inside RUN "
+            f"({marker.group(0)!r}). Use Dockerfile-native `RUN <<EOF` or "
+            "rewrite with printf/COPY heredoc; otherwise Docker parses the body "
+            "as Dockerfile instructions."
+        )
+    return None
+
+
+def _lock_for_build_key(key: str) -> threading.Lock:
+    with _BUILD_LOCKS_GUARD:
+        lock = _BUILD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _BUILD_LOCKS[key] = lock
+        return lock
+
+
+def build_docker_image(
+    task: dict[str, Any],
+    timeout: float = 1200.0,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> None:
     dataset_dir = str(os.getenv("DATASET_DIR", "")).strip()
     if not dataset_dir:
         raise ValueError("DATASET_DIR is required")
 
     task_path = Path(dataset_dir) / str(task.get("task_path", ""))
+    task_name = _safe_project_component(str(task.get("task_name") or task_path.name))
     trial_handler = TrialHandler(
-        trial_name="build_run",
+        trial_name=f"build_run_{task_name}",
         input_path=task_path,
         output_path=Path("build_outputs"),
     )
@@ -125,11 +414,92 @@ def build_docker_image(task: dict[str, Any], timeout: float = 1200.0) -> None:
         sessions_logs_path=trial_handler.trial_paths.sessions_path,
         agent_logs_path=trial_handler.trial_paths.agent_logging_dir,
     )
-    import inspect
-    if "timeout" in inspect.signature(compose_manager.build).parameters:
-        compose_manager.build(timeout=timeout)
-    else:
-        compose_manager.build()
+    build_key = trial_handler.client_image_name
+    build_dedup = _env_bool("WORKER_DOCKER_BUILD_DEDUP", True)
+    skip_existing = _env_bool("WORKER_DOCKER_BUILD_SKIP_EXISTING", True)
+    build_lock = _lock_for_build_key(build_key) if build_dedup else threading.Lock()
+    queue_timeout = _build_queue_timeout()
+    deadline = time.monotonic() + queue_timeout if queue_timeout > 0 else None
+    build_lock_acquired = False
+    build_semaphore_acquired = False
+
+    _raise_if_cancelled(cancel_event, build_key=build_key, stage="before_lock")
+    _acquire_build_gate(
+        build_lock,
+        build_key=build_key,
+        label="image_lock",
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
+    build_lock_acquired = True
+    try:
+        _raise_if_cancelled(cancel_event, build_key=build_key, stage="after_lock")
+        if build_key in _BUILD_DONE:
+            return
+        blacklisted_failure = _cached_task_image_blacklist(build_key)
+        if blacklisted_failure is not None:
+            raise TaskImageBlacklistedError(
+                f"TASK_IMAGE_BLACKLISTED image={build_key}: {blacklisted_failure}"
+            )
+        cached_failure = _cached_build_failure(build_key)
+        if cached_failure is not None:
+            raise DockerImageBuildError(
+                f"TASK_BUILD_FAILED cached for image={build_key}: {cached_failure}"
+            )
+        if skip_existing and _docker_image_exists_locally(build_key):
+            logger.debug("Docker image already exists locally; skip build: %s", build_key)
+            _BUILD_DONE.add(build_key)
+            _BUILD_FAILED.pop(build_key, None)
+            _TASK_IMAGE_BLACKLISTED.pop(build_key, None)
+            return
+        precheck_error = _dockerfile_precheck_error(task_path)
+        if precheck_error is not None:
+            message = (
+                f"TASK_DOCKERFILE_PRECHECK_FAILED task={task_name}: {precheck_error}"
+            )
+            _BUILD_FAILED[build_key] = (time.time(), message)
+            _blacklist_task_image(build_key, message)
+            raise TaskImageBlacklistedError(
+                f"TASK_IMAGE_BLACKLISTED image={build_key}: {message}"
+            )
+
+        _acquire_build_gate(
+            _BUILD_SEMAPHORE,
+            build_key=build_key,
+            label="global_build_semaphore",
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
+        build_semaphore_acquired = True
+        _record_build_active(1)
+        try:
+            _raise_if_cancelled(cancel_event, build_key=build_key, stage="before_build")
+            import inspect
+
+            logger.info("Building Docker image for task=%s image=%s", task_name, build_key)
+            try:
+                if "timeout" in inspect.signature(compose_manager.build).parameters:
+                    compose_manager.build(timeout=timeout)
+                else:
+                    compose_manager.build()
+            except Exception as exc:
+                message = _shorten_output(str(exc), max_chars=1200) or type(exc).__name__
+                _BUILD_FAILED[build_key] = (time.time(), message)
+                if _is_deterministic_build_failure(message):
+                    _blacklist_task_image(build_key, message)
+                raise DockerImageBuildError(
+                    f"TASK_BUILD_FAILED image={build_key} task={task_name}: {message}"
+                ) from exc
+            _BUILD_DONE.add(build_key)
+            _BUILD_FAILED.pop(build_key, None)
+            _TASK_IMAGE_BLACKLISTED.pop(build_key, None)
+        finally:
+            _record_build_active(-1)
+            if build_semaphore_acquired:
+                _BUILD_SEMAPHORE.release()
+    finally:
+        if build_lock_acquired:
+            build_lock.release()
 
 
 def _resolve_pull_image(task: dict[str, Any]) -> str:
@@ -199,18 +569,23 @@ def pull_docker_image(image: str, timeout: float = 1200.0) -> None:
 def prepare_task_docker_image(
     task: dict[str, Any],
     timeout: float = 1200.0,
+    *,
+    cancel_event: threading.Event | None = None,
 ) -> ImagePreparationResult:
     raw_mode = str(os.getenv("TBENCH_DOCKER_IMAGE_SOURCE", "")).strip().lower()
     if not raw_mode:
         raise ValueError("TBENCH_DOCKER_IMAGE_SOURCE is required")
 
     if raw_mode in {"build", "docker_build"}:
-        build_docker_image(task=task, timeout=timeout)
+        build_docker_image(task=task, timeout=timeout, cancel_event=cancel_event)
         return ImagePreparationResult(mode="build", client_image_name=None)
 
     if raw_mode in {"pull", "docker_pull"}:
+        task_name = str(task.get("task_name") or task.get("task_path") or "unknown")
+        _raise_if_cancelled(cancel_event, build_key=task_name, stage="before_pull")
         image = _resolve_pull_image(task=task)
         pull_docker_image(image=image, timeout=timeout)
+        _raise_if_cancelled(cancel_event, build_key=image, stage="after_pull")
         return ImagePreparationResult(mode="pull", client_image_name=image)
 
     raise ValueError(
@@ -219,6 +594,7 @@ def prepare_task_docker_image(
 
 
 _DEFAULT_CONTAINER_MEMORY_LIMIT = os.getenv("CONTAINER_MEMORY_LIMIT", "16g")
+_DEFAULT_CONTAINER_PIDS_LIMIT = os.getenv("CONTAINER_PIDS_LIMIT", "64")
 
 
 def _apply_container_memory_limit(
@@ -247,6 +623,51 @@ def _apply_container_memory_limit(
             logger.warning(
                 "Failed to apply memory limit to container %s: %s", container_name, exc
             )
+
+
+def _apply_container_pids_limit(
+    container_name: str,
+    pids_limit: str,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Best-effort ``docker update --pids-limit`` on a running container."""
+    if not pids_limit:
+        return
+    try:
+        value = int(str(pids_limit).strip())
+    except ValueError:
+        if logger is not None:
+            logger.warning(
+                "Invalid CONTAINER_PIDS_LIMIT=%r; skipping pids limit for %s",
+                pids_limit,
+                container_name,
+            )
+        return
+    if value <= 0:
+        return
+
+    cmd = ["docker", "update", f"--pids-limit={value}", container_name]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=30.0)
+        if logger is not None:
+            logger.info("Applied pids limit %s to container %s", value, container_name)
+    except Exception as exc:
+        if logger is not None:
+            logger.warning(
+                "Failed to apply pids limit to container %s: %s", container_name, exc
+            )
+
+
+def _apply_container_runtime_limits(
+    container_name: str,
+    logger: logging.Logger | None = None,
+) -> None:
+    _apply_container_pids_limit(
+        container_name, _DEFAULT_CONTAINER_PIDS_LIMIT, logger=logger
+    )
+    _apply_container_memory_limit(
+        container_name, _DEFAULT_CONTAINER_MEMORY_LIMIT, logger=logger
+    )
 
 
 def compose_up_no_build(
@@ -346,9 +767,7 @@ def compose_up_no_build(
                 container = compose_manager._client.containers.get(container_name)
                 terminal.container = container
                 compose_manager._client_container = container
-                _apply_container_memory_limit(
-                    container_name, _DEFAULT_CONTAINER_MEMORY_LIMIT, logger=logger
-                )
+                _apply_container_runtime_limits(container_name, logger=logger)
                 return
 
             raise RuntimeError(
@@ -373,6 +792,4 @@ def compose_up_no_build(
     container = compose_manager._client.containers.get(container_name)
     terminal.container = container
     compose_manager._client_container = container
-    _apply_container_memory_limit(
-        container_name, _DEFAULT_CONTAINER_MEMORY_LIMIT, logger=logger
-    )
+    _apply_container_runtime_limits(container_name, logger=logger)

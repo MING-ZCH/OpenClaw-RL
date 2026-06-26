@@ -204,6 +204,145 @@ def _train_step_start(args: Namespace, rollout_id: int) -> int:
     return int(rollout_id) * max(1, steps_per_rollout)
 
 
+def _agent57_lite_enabled() -> bool:
+    for name in (
+        "EXPLORE_AGENT57_LITE_ENABLED",
+        "EXPLORE_AGENT57_LITE",
+        "EXPLORE_AGENT57_LIFELONG_ENABLED",
+        "EXPLORE_AGENT57_LIFELONG",
+    ):
+        if os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+    return os.getenv("EXPLORE_AGENT57_CONTROLLER", "fixed").strip().lower() == "ucb"
+
+
+def _fallback_agent57_arms(group_size: int) -> list[int]:
+    try:
+        k = int(os.getenv("EXPLORE_AGENT57_K", "8") or "8")
+    except ValueError:
+        k = 8
+    k = max(1, k)
+    return [idx % k for idx in range(max(0, group_size))]
+
+
+def _agent57_float_list(name: str) -> list[float]:
+    values: list[float] = []
+    for part in os.getenv(name, "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.append(float(part))
+        except ValueError:
+            continue
+    return values
+
+
+def _agent57_int_list(name: str) -> list[int]:
+    values: list[int] = []
+    for part in os.getenv(name, "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.append(int(part))
+        except ValueError:
+            continue
+    return values
+
+
+def _agent57_int_env(name: str, default: int = 0) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _agent57_value_for_arm(values: list[Any], arm_id: int) -> Any | None:
+    if not values:
+        return None
+    return values[int(arm_id) % len(values)]
+
+
+def _agent57_sampling_warmup_active(metadata: dict[str, Any]) -> bool:
+    warmup_rollouts = _agent57_int_env("EXPLORE_AGENT57_ARM_TEMPERATURE_WARMUP_ROLLOUTS", 0)
+    if warmup_rollouts <= 0:
+        return False
+    try:
+        rollout_id = int(metadata.get("rollout_id", warmup_rollouts))
+    except (TypeError, ValueError):
+        rollout_id = warmup_rollouts
+    return rollout_id < warmup_rollouts
+
+
+def _apply_agent57_sampling_params(sample: Sample, sampling_params: dict[str, Any]) -> None:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    if not metadata.get("agent57_lite_enabled"):
+        return
+    if _agent57_sampling_warmup_active(metadata):
+        metadata["agent57_sampling_warmup_active"] = 1
+        return
+    metadata["agent57_sampling_warmup_active"] = 0
+    try:
+        arm_id = int(metadata.get("agent57_arm_id", 0))
+    except (TypeError, ValueError):
+        arm_id = 0
+
+    temp = _agent57_value_for_arm(_agent57_float_list("EXPLORE_AGENT57_ARM_TEMPERATURES"), arm_id)
+    top_p = _agent57_value_for_arm(_agent57_float_list("EXPLORE_AGENT57_ARM_TOP_PS"), arm_id)
+    top_k = _agent57_value_for_arm(_agent57_int_list("EXPLORE_AGENT57_ARM_TOP_KS"), arm_id)
+    if temp is not None:
+        sampling_params["temperature"] = float(temp)
+    if top_p is not None:
+        sampling_params["top_p"] = float(top_p)
+    if top_k is not None:
+        sampling_params["top_k"] = int(top_k)
+
+
+def _agent57_dataset_context(group: list[Sample]) -> str | None:
+    if not group:
+        return None
+    sample = group[0]
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    prompt = sample.prompt if isinstance(sample.prompt, dict) else {}
+    task_meta = metadata.get("task_meta") if isinstance(metadata.get("task_meta"), dict) else {}
+    raw = (
+        metadata.get("data_source")
+        or task_meta.get("data_source")
+        or prompt.get("data_source")
+    )
+    if raw:
+        return str(raw)
+    task_path = str(metadata.get("task_path") or task_meta.get("task_path") or "")
+    if task_path.startswith("agent_safetybench/"):
+        return "agent_safetybench"
+    if task_path.startswith("seta_env/") or "seta" in task_path:
+        return "seta"
+    if task_path.startswith("agentharm/") or "agentharm" in task_path:
+        return "agentharm"
+    return None
+
+
+def _assign_agent57_arms(
+    group_size: int,
+    *,
+    evaluation: bool,
+    dataset: str | None = None,
+) -> list[int]:
+    if evaluation or not _agent57_lite_enabled():
+        return []
+    try:
+        from explore_agent57_lite import assign_group_arms
+
+        return assign_group_arms(group_size, evaluation=evaluation, dataset=dataset)
+    except Exception as exc:
+        logger.warning("Agent57-lite arm assignment fallback: %s", exc)
+        return _fallback_agent57_arms(group_size)
+
+
 def _annotate_rollout_sample(args: Namespace, sample: Sample, rollout_id: int, *, evaluation: bool) -> None:
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
     sample.metadata = dict(metadata)
@@ -217,8 +356,20 @@ def _annotate_rollout_groups(
     args: Namespace, samples: list[list[Sample]], rollout_id: int, *, evaluation: bool
 ) -> None:
     for group in samples:
-        for sample in group:
+        agent57_dataset = _agent57_dataset_context(group)
+        agent57_arms = _assign_agent57_arms(
+            len(group),
+            evaluation=evaluation,
+            dataset=agent57_dataset,
+        )
+        for idx, sample in enumerate(group):
             _annotate_rollout_sample(args, sample, rollout_id, evaluation=evaluation)
+            if agent57_arms:
+                sample.metadata["agent57_lite_enabled"] = True
+                sample.metadata["agent57_arm_id"] = int(agent57_arms[idx])
+                sample.metadata["agent57_group_position"] = int(idx)
+                if agent57_dataset:
+                    sample.metadata["agent57_dataset"] = agent57_dataset
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -460,6 +611,7 @@ async def generate_and_rm_group(
     tasks = []
     for idx, sample in enumerate(group):
         current_sampling_params = sampling_params.copy()
+        _apply_agent57_sampling_params(sample, current_sampling_params)
         if getattr(args, "sglang_enable_deterministic_inference", False):
             seed = state.group_sampling_seeds[idx]
             current_sampling_params["sampling_seed"] = seed

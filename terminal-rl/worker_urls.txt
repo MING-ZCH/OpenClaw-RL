@@ -1,0 +1,5 @@
+# safevo share-docker-server 需要根据开发机 ip 更新。
+# 修改本文件后，router 会按 WORKER_URLS_RELOAD_INTERVAL 热加载；当前脚本默认 120s。
+# 测试连通性：
+#   curl -fsS --noproxy '*' http://100.100.66.216:18081/healthz
+export WORKER_URLS="http://100.100.66.216:18081"  # 测试连通性 curl -fsS --noproxy '*' http://100.100.66.216:18081/healthz

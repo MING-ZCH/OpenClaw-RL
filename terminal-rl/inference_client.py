@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import inspect
+import json
 import logging
 import time
 import traceback
@@ -24,6 +25,24 @@ from slime.utils.http_utils import post as async_post
 from custom_types import Interaction
 
 logger = logging.getLogger(__name__)
+
+
+def _tool_arguments_json(arguments: Any) -> str:
+    """Return a JSON object string suitable for CAMEL ToolCallRequest parsing."""
+    if isinstance(arguments, dict):
+        normalized = arguments
+    elif isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError:
+            normalized = {"__raw_arguments__": arguments}
+        else:
+            normalized = (
+                parsed if isinstance(parsed, dict) else {"__raw_arguments__": parsed}
+            )
+    else:
+        normalized = {"__raw_arguments__": arguments}
+    return json.dumps(normalized, ensure_ascii=False)
 
 
 def process_tool_calls(
@@ -73,7 +92,7 @@ def process_tool_calls(
                         id=f"fc-{uuid.uuid4().hex[:24]}",
                         call_id=f"call_{uuid.uuid4().hex[:24]}",
                         name=call_info.name,
-                        arguments=call_info.parameters,
+                        arguments=_tool_arguments_json(call_info.parameters),
                         status="completed",
                     )
                     for call_info in call_info_list
@@ -84,7 +103,8 @@ def process_tool_calls(
                         type="function",
                         id=f"call_{uuid.uuid4().hex[:24]}",
                         function=Function(
-                            name=call_info.name, arguments=call_info.parameters
+                            name=call_info.name,
+                            arguments=_tool_arguments_json(call_info.parameters),
                         ),
                     )
                     for call_info in call_info_list

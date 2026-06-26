@@ -1,4 +1,5 @@
 import logging
+import os
 import socket
 
 import ray
@@ -45,6 +46,14 @@ def _create_placement_group(num_gpus):
     num_bundles = len(bundles)
 
     ray.get(pg.ready())
+    if os.environ.get("SLIME_RAY_PLACEMENT_GPU_PROBE", "1") == "0":
+        logger.info("Skipping InfoActor GPU probing; using placement-group bundle order as GPU order.")
+        pg_reordered_bundle_indices = list(range(num_bundles))
+        pg_reordered_gpu_ids = list(range(num_bundles))
+        for i in range(num_bundles):
+            logger.info(f"  bundle {i:4}, actual_bundle_index: {i:4}, gpu: {i} (assumed)")
+        return pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids
+
     # use info actor to get the GPU id
     info_actors = []
     for i in range(num_bundles):
