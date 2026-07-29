@@ -44,6 +44,7 @@ EVAL_N_SAMPLES="${EVAL_N_SAMPLES:-1}"
 EVAL_TEMPERATURE="${EVAL_TEMPERATURE:-0.6}"
 EVAL_TOP_P="${EVAL_TOP_P:-0.95}"
 EVAL_TOP_K="${EVAL_TOP_K:-20}"
+EVAL_MIN_P="${EVAL_MIN_P:-0}"
 EVAL_SEED="${EVAL_SEED:-1234}"
 ROLLOUT_SEED="${ROLLOUT_SEED:-42}"
 EVAL_DETERMINISTIC="${EVAL_DETERMINISTIC:-0}"
@@ -51,6 +52,11 @@ EVAL_MAX_RESPONSE_LEN="${EVAL_MAX_RESPONSE_LEN:-16384}"
 EVAL_MAX_PROMPT_LEN="${EVAL_MAX_PROMPT_LEN:-16384}"
 EVAL_MAX_CONTEXT_LEN="${EVAL_MAX_CONTEXT_LEN:-$((EVAL_MAX_PROMPT_LEN + EVAL_MAX_RESPONSE_LEN))}"
 MAX_TURN="${MAX_TURN:-10}"
+TERMINAL_MAX_TOTAL_TOKENS="${TERMINAL_MAX_TOTAL_TOKENS:-32768}"
+SGLANG_CONTEXT_LENGTH="${SGLANG_CONTEXT_LENGTH:-}"
+SGLANG_JSON_MODEL_OVERRIDE_ARGS="${SGLANG_JSON_MODEL_OVERRIDE_ARGS:-}"
+SWEBENCH_AGENT_PROFILE="${SWEBENCH_AGENT_PROFILE:-custom}"
+SWEBENCH_MODEL_NAME_OR_PATH="${SWEBENCH_MODEL_NAME_OR_PATH:-Qwen/Qwen3-8B}"
 EVAL_LIMIT="${EVAL_LIMIT:-}"
 EVAL_MAX_CONCURRENCY="${EVAL_MAX_CONCURRENCY:-}"
 EVAL_DRY_RUN="${EVAL_DRY_RUN:-0}"
@@ -58,19 +64,16 @@ FORMAL_SWEBENCH_VERIFIED="${FORMAL_SWEBENCH_VERIFIED:-0}"
 SWEBENCH_DEFER_GRADING="${SWEBENCH_DEFER_GRADING:-0}"
 OFFICIAL_SWEBENCH_VERIFIED_INSTANCES=500
 OFFICIAL_SWEBENCH_VERIFIED_SHA256="4282529dbcc1b9253fa91da35b9f1768a2002b391cc90ac6a4e64575d59cfbf3"
+OFFICIAL_SWEBENCH_VERIFIED_OFFICIAL_SHA256="f61cd55ceb35b61ad592f645abcbfc8ea4d294c6c9f3c8f15e83211a8e8db98c"
 HARNESS_OPTION="${HARNESS_OPTION:-camel-agent}"
 SETA_SAFETY="${SETA_SAFETY:-none}"
 SAFETY_BENCH_REWARD="${SAFETY_BENCH_REWARD:-rule}"
 AGENTHARM_REWARD="${AGENTHARM_REWARD:-rule}"
 SAFETY_REWARD_COEF="${SAFETY_REWARD_COEF:-0}"
 
+DETECTED_GPUS=0
 if command -v nvidia-smi >/dev/null 2>&1; then
-  DETECTED_GPUS="$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)"
-else
-  DETECTED_GPUS=0
-fi
-if [[ "${DETECTED_GPUS}" -le 0 ]]; then
-  DETECTED_GPUS=4
+  DETECTED_GPUS="$(nvidia-smi -L 2>/dev/null | awk 'END {print NR + 0}')"
 fi
 NUM_GPUS="${NUM_GPUS:-${DETECTED_GPUS}}"
 ROLLOUT_GPUS="${ROLLOUT_GPUS:-${NUM_GPUS}}"
@@ -84,6 +87,10 @@ MEGATRON_TP_SIZE="${MEGATRON_TP_SIZE:-1}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-16384}"
 ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
 
+if (( NUM_GPUS <= 0 || ROLLOUT_GPUS <= 0 )); then
+  echo "[ERROR] Eval requires visible rollout GPUs or explicit positive NUM_GPUS/ROLLOUT_GPUS." >&2
+  exit 2
+fi
 ACTOR_WORLD_SIZE=$((ACTOR_NUM_NODES * ACTOR_NUM_GPUS_PER_NODE))
 if (( MEGATRON_TP_SIZE <= 0 || ACTOR_WORLD_SIZE % MEGATRON_TP_SIZE != 0 )); then
   echo "[ERROR] Megatron eval topology is invalid: actor_world_size=${ACTOR_WORLD_SIZE}, megatron_tp=${MEGATRON_TP_SIZE}." >&2
@@ -155,6 +162,34 @@ if [[ "${FORMAL_SWEBENCH_VERIFIED}" == "1" ]]; then
     echo "[ERROR] Formal SWE-bench Verified requires at least 4 visible GPUs; detected ${DETECTED_GPUS}." >&2
     exit 2
   fi
+  FORMAL_PROFILE_EXPECTATIONS=(
+    "SWEBENCH_AGENT_PROFILE=qwen3_official_think_64k_terminal_ref_v1"
+    "SWEBENCH_MODEL_NAME_OR_PATH=Qwen/Qwen3-8B"
+    "HARNESS_OPTION=camel-agent"
+    "EVAL_TEMPERATURE=0.6"
+    "EVAL_TOP_P=0.95"
+    "EVAL_TOP_K=20"
+    "EVAL_MIN_P=0"
+    "EVAL_N_SAMPLES=1"
+    "EVAL_MAX_PROMPT_LEN=32768"
+    "EVAL_MAX_RESPONSE_LEN=32768"
+    "EVAL_MAX_CONTEXT_LEN=65536"
+    "TERMINAL_MAX_TOTAL_TOKENS=65536"
+    "MAX_TURN=200"
+    "SGLANG_CONTEXT_LENGTH=65536"
+    'SGLANG_JSON_MODEL_OVERRIDE_ARGS={"rope_scaling":{"rope_type":"yarn","factor":2.0,"original_max_position_embeddings":32768}}'
+    "EVAL_SEED=1234"
+    "ROLLOUT_SEED=42"
+    "EVAL_DETERMINISTIC=1"
+  )
+  for expectation in "${FORMAL_PROFILE_EXPECTATIONS[@]}"; do
+    name="${expectation%%=*}"
+    expected="${expectation#*=}"
+    if [[ "${!name}" != "${expected}" ]]; then
+      echo "[ERROR] Formal SWE-bench profile requires ${name}=${expected}; got ${!name}." >&2
+      exit 2
+    fi
+  done
   if [[ -n "${SWEBENCH_EXPECTED_INSTANCES:-}" && "${SWEBENCH_EXPECTED_INSTANCES}" != "${OFFICIAL_SWEBENCH_VERIFIED_INSTANCES}" ]]; then
     echo "[ERROR] Formal SWE-bench Verified count is pinned to ${OFFICIAL_SWEBENCH_VERIFIED_INSTANCES}; got ${SWEBENCH_EXPECTED_INSTANCES}." >&2
     exit 2
@@ -163,9 +198,17 @@ if [[ "${FORMAL_SWEBENCH_VERIFIED}" == "1" ]]; then
     echo "[ERROR] Formal SWE-bench Verified dataset SHA256 is pinned to the official converted dataset." >&2
     exit 2
   fi
+  if [[ -n "${SWEBENCH_EXPECTED_OFFICIAL_DATASET_SHA256:-}" && "${SWEBENCH_EXPECTED_OFFICIAL_DATASET_SHA256}" != "${OFFICIAL_SWEBENCH_VERIFIED_OFFICIAL_SHA256}" ]]; then
+    echo "[ERROR] Formal official SWE-bench dataset SHA256 is pinned." >&2
+    exit 2
+  fi
   SWEBENCH_EXPECTED_INSTANCES="${OFFICIAL_SWEBENCH_VERIFIED_INSTANCES}"
   SWEBENCH_EXPECTED_DATASET_SHA256="${OFFICIAL_SWEBENCH_VERIFIED_SHA256}"
-  export SWEBENCH_EXPECTED_INSTANCES SWEBENCH_EXPECTED_DATASET_SHA256
+  SWEBENCH_EXPECTED_OFFICIAL_DATASET_SHA256="${OFFICIAL_SWEBENCH_VERIFIED_OFFICIAL_SHA256}"
+  export \
+    SWEBENCH_EXPECTED_INSTANCES \
+    SWEBENCH_EXPECTED_DATASET_SHA256 \
+    SWEBENCH_EXPECTED_OFFICIAL_DATASET_SHA256
 fi
 if [[ "${SWEBENCH_DEFER_GRADING}" != "0" && "${SWEBENCH_DEFER_GRADING}" != "1" ]]; then
   echo "[ERROR] SWEBENCH_DEFER_GRADING must be 0 or 1." >&2
@@ -185,6 +228,7 @@ SAFETY_DATA="${SCRIPT_DIR}/dataset/agent_safetybench_convert/train.jsonl"
 AGENTHARM_DATA="${SCRIPT_DIR}/dataset/agentharm_convert/val.jsonl"
 SETA_DATA="${SCRIPT_DIR}/dataset/seta_env_convert/train.jsonl"
 SWEVERIFIED_DATA="${SWEVERIFIED_DATA:-${SCRIPT_DIR}/dataset/sweverified_convert/test.jsonl}"
+SWEVERIFIED_OFFICIAL_DATA="${SWEVERIFIED_OFFICIAL_DATA:-${SCRIPT_DIR}/dataset/sweverified_convert/official_test.jsonl}"
 
 EVAL_PROMPT_DATA=()
 INCLUDES_SETA=0
@@ -231,22 +275,27 @@ done
 SWEBENCH_DATASET_ROWS=""
 SWEBENCH_DATASET_UNIQUE_IDS=""
 SWEBENCH_DATASET_SHA256=""
+SWEBENCH_OFFICIAL_DATA_SHA256=""
 if [[ "${INCLUDES_SWEVERIFIED}" == "1" ]]; then
   if ! SWEBENCH_PREFLIGHT_OUTPUT="$(
     "${TRAIN_PYTHON}" - \
       "${SWEVERIFIED_DATA}" \
+      "${SWEVERIFIED_OFFICIAL_DATA}" \
       "${FORMAL_SWEBENCH_VERIFIED}" \
       "${SWEBENCH_EXPECTED_INSTANCES:-500}" \
-      "${SWEBENCH_EXPECTED_DATASET_SHA256:-}" 2>&1 <<'PY'
+      "${SWEBENCH_EXPECTED_DATASET_SHA256:-}" \
+      "${SWEBENCH_EXPECTED_OFFICIAL_DATASET_SHA256:-}" 2>&1 <<'PY'
 import hashlib
 import json
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
-formal = sys.argv[2] == "1"
-expected = int(sys.argv[3])
-expected_sha256 = sys.argv[4].strip().lower()
+official_path = Path(sys.argv[2])
+formal = sys.argv[3] == "1"
+expected = int(sys.argv[4])
+expected_sha256 = sys.argv[5].strip().lower()
+expected_official_sha256 = sys.argv[6].strip().lower()
 rows = []
 ids = []
 expected_harness_version = "4.1.0"
@@ -294,13 +343,62 @@ if expected_sha256 and digest != expected_sha256:
         "SWE-bench Verified dataset fingerprint mismatch: "
         f"actual={digest} expected={expected_sha256}"
     )
-print(len(rows), len(unique_ids), digest)
+if not official_path.is_file():
+    raise SystemExit(f"missing pinned official SWE-bench dataset: {official_path}")
+official_rows = []
+official_ids = []
+required_official_fields = {
+    "repo",
+    "instance_id",
+    "base_commit",
+    "patch",
+    "test_patch",
+    "problem_statement",
+    "version",
+    "FAIL_TO_PASS",
+    "PASS_TO_PASS",
+}
+for line_no, line in enumerate(
+    official_path.read_text(encoding="utf-8").splitlines(), 1
+):
+    if not line.strip():
+        continue
+    row = json.loads(line)
+    missing = required_official_fields - set(row)
+    if missing:
+        raise SystemExit(
+            f"official row {line_no}: missing fields {sorted(missing)}"
+        )
+    official_ids.append(str(row["instance_id"]))
+    official_rows.append(row)
+if len(set(official_ids)) != len(official_ids):
+    raise SystemExit("duplicate IDs in pinned official SWE-bench dataset")
+if set(official_ids) != unique_ids:
+    raise SystemExit(
+        "converted and official SWE-bench datasets contain different instance IDs"
+    )
+if formal and len(official_rows) != expected:
+    raise SystemExit(
+        f"formal pinned official dataset requires {expected} rows, "
+        f"found {len(official_rows)}"
+    )
+official_digest = hashlib.sha256(official_path.read_bytes()).hexdigest()
+if expected_official_sha256 and official_digest != expected_official_sha256:
+    raise SystemExit(
+        "pinned official SWE-bench dataset fingerprint mismatch: "
+        f"actual={official_digest} expected={expected_official_sha256}"
+    )
+print(len(rows), len(unique_ids), digest, official_digest)
 PY
   )"; then
     echo "[ERROR] SWE-bench Verified dataset preflight failed: ${SWEBENCH_PREFLIGHT_OUTPUT}" >&2
     exit 2
   fi
-  read -r SWEBENCH_DATASET_ROWS SWEBENCH_DATASET_UNIQUE_IDS SWEBENCH_DATASET_SHA256 <<< "${SWEBENCH_PREFLIGHT_OUTPUT}"
+  read -r \
+    SWEBENCH_DATASET_ROWS \
+    SWEBENCH_DATASET_UNIQUE_IDS \
+    SWEBENCH_DATASET_SHA256 \
+    SWEBENCH_OFFICIAL_DATA_SHA256 <<< "${SWEBENCH_PREFLIGHT_OUTPUT}"
 fi
 
 export AGENT_SAFETYBENCH_REMOTE_ENV=0
@@ -471,6 +569,11 @@ RUN_ID="${RUN_ID:-eval_qwen3-8b_${CKPT_LABEL}_${EVAL_SUITE}_${RUN_TIMESTAMP}}"
 RUN_DIR="${RUNS_ROOT}/${RUN_ID}"
 RUN_LOG_DIR="${RUN_DIR}/logs"
 mkdir -p "${RUN_LOG_DIR}" "${RUN_DIR}/config" "${RUN_DIR}/trajectories"
+SWEBENCH_RUN_OFFICIAL_DATA=""
+if [[ "${INCLUDES_SWEVERIFIED}" == "1" ]]; then
+  SWEBENCH_RUN_OFFICIAL_DATA="${RUN_DIR}/config/swebench_verified_official_test.jsonl"
+  install -m 0644 "${SWEVERIFIED_OFFICIAL_DATA}" "${SWEBENCH_RUN_OFFICIAL_DATA}"
+fi
 
 if [[ "${RESET_RUN_OUTPUTS:-1}" == "1" ]]; then
   rm -f \
@@ -507,15 +610,32 @@ fi
 
 BASE_CUSTOM_CONFIG_PATH="${CUSTOM_CONFIG_PATH:-${SCRIPT_DIR}/configs/rollout_qwen3_think.yaml}"
 CUSTOM_CONFIG_PATH="${RUN_DIR}/config/rollout_qwen3_think_eval.yaml"
-"${TRAIN_PYTHON}" - "$BASE_CUSTOM_CONFIG_PATH" "$CUSTOM_CONFIG_PATH" "$MAX_TURN" "$HARNESS_OPTION" <<'PY'
+if [[ "${FORMAL_SWEBENCH_VERIFIED}" == "1" ]]; then
+  CANONICAL_CUSTOM_CONFIG_PATH="${SCRIPT_DIR}/configs/rollout_qwen3_think.yaml"
+  if [[ "$(readlink -f "${BASE_CUSTOM_CONFIG_PATH}")" != "$(readlink -f "${CANONICAL_CUSTOM_CONFIG_PATH}")" ]]; then
+    echo "[ERROR] Formal SWE-bench profile requires ${CANONICAL_CUSTOM_CONFIG_PATH}." >&2
+    exit 2
+  fi
+fi
+"${TRAIN_PYTHON}" - \
+  "$BASE_CUSTOM_CONFIG_PATH" \
+  "$CUSTOM_CONFIG_PATH" \
+  "$MAX_TURN" \
+  "$HARNESS_OPTION" \
+  "$TERMINAL_MAX_TOTAL_TOKENS" <<'PY'
 import sys
 import yaml
 
-src, dst, max_turn, harness = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+src, dst = sys.argv[1:3]
+max_turn = int(sys.argv[3])
+harness = sys.argv[4]
+max_total_tokens = int(sys.argv[5])
 with open(src) as f:
     cfg = yaml.safe_load(f) or {}
 cfg["max_iteration"] = max_turn
 cfg["harness_option"] = harness
+cfg["terminal_agent_type"] = "camel_agent"
+cfg["max_total_tokens"] = max_total_tokens
 cfg["non_think_mode"] = False
 cfg["trajectory_save_interval"] = 1
 with open(dst, "w") as f:
@@ -525,7 +645,7 @@ PY
 export TERMINAL_STRUCTURED_METRICS="${TERMINAL_STRUCTURED_METRICS:-1}"
 export TERMINAL_METRICS_JSONL="${TERMINAL_METRICS_JSONL:-${RUN_LOG_DIR}/metrics.jsonl}"
 export TERMINAL_SAVE_TRAJ_DIR="${TERMINAL_SAVE_TRAJ_DIR:-${RUN_DIR}/trajectories}"
-export SWEBENCH_MODEL_NAME_OR_PATH="${SWEBENCH_MODEL_NAME_OR_PATH:-Qwen/Qwen3-8B}"
+export SWEBENCH_MODEL_NAME_OR_PATH
 export SWEBENCH_RESULTS_DIR="${SWEBENCH_RESULTS_DIR:-${RUN_DIR}/swebench_official}"
 if [[ "${EVAL_SUITE}" == "sweverified" ]]; then
   export SWEBENCH_EVAL_DATA_PATH="${EVAL_PROMPT_DATA[1]}"
@@ -573,12 +693,29 @@ if formal:
         "num_hidden_layers": 36,
         "hidden_size": 4096,
         "intermediate_size": 12288,
+        "max_position_embeddings": 40960,
     }
     for key, value in expected.items():
         if config.get(key) != value:
             raise SystemExit(
                 f"HF_CKPT is not the expected Qwen3-8B architecture: "
                 f"{key}={config.get(key)!r}, expected={value!r}"
+            )
+    generation_path = model_dir / "generation_config.json"
+    if not generation_path.is_file():
+        raise SystemExit(f"missing official generation config: {generation_path}")
+    generation = json.loads(generation_path.read_text(encoding="utf-8"))
+    generation_expected = {
+        "do_sample": True,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+    }
+    for key, value in generation_expected.items():
+        if generation.get(key) != value:
+            raise SystemExit(
+                f"official Qwen3-8B generation config mismatch: "
+                f"{key}={generation.get(key)!r}, expected={value!r}"
             )
 
 def digest_entries(entries):
@@ -729,6 +866,7 @@ echo "  Suite:   ${EVAL_SUITE}"
 echo "  Ckpt:    ${EVAL_CKPT} load=${LOAD_CKPT} step=${CKPT_STEP_ARGS[*]:-latest}"
 echo "  Served:  HF_CKPT=${HF_CKPT} (--debug-rollout-only SGLang source)"
 echo "  Model:   revision=${HF_MODEL_REVISION} manifest=${HF_MODEL_MANIFEST_SHA256}"
+echo "  Profile: ${SWEBENCH_AGENT_PROFILE} sampling=${EVAL_TEMPERATURE}/${EVAL_TOP_P}/${EVAL_TOP_K}/${EVAL_MIN_P} context=${EVAL_MAX_PROMPT_LEN}+${EVAL_MAX_RESPONSE_LEN}/${SGLANG_CONTEXT_LENGTH:-model-default}"
 echo "  Data:    ${EVAL_PROMPT_DATA[*]}"
 echo "  Topology: Megatron actor=${ACTOR_WORLD_SIZE}/TP${MEGATRON_TP_SIZE}; SGLang=${ROLLOUT_GPUS} GPUs, $((ROLLOUT_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE)) engines x TP${ROLLOUT_NUM_GPUS_PER_ENGINE}"
 echo "  Metrics: ${TERMINAL_METRICS_JSONL}"
@@ -740,7 +878,7 @@ if [[ "${EVAL_SUITE}" == "sweverified" ]]; then
   log "SWE-bench timeouts: image=${TERMINAL_ENSURE_IMAGE_TIMEOUT}s reset_session=${TERMINAL_RESET_SESSION_TIMEOUT}s eval=${TERMINAL_EVAL_TIMEOUT}s router=${ROUTER_FORWARD_TIMEOUT}s client=${ENV_RESET_HTTP_TIMEOUT}s heartbeat=${ENV_HEARTBEAT_HTTP_TIMEOUT}s retries=${ROUTER_FORWARD_RETRIES} eval_concurrency=${EVAL_MAX_CONCURRENCY} worker_builds=${SWEBENCH_WORKER_MAX_CONCURRENT_BUILDS}"
   log "Terminal env retries: http=${ENV_HTTP_MAX_RETRIES} allocate=${ENV_ALLOCATE_MAX_RETRIES} reset=${ENV_RESET_MAX_RETRIES} exec_tool=${ENV_EXEC_TOOL_MAX_RETRIES} evaluate=${ENV_EVALUATE_MAX_RETRIES} close=${ENV_CLOSE_MAX_RETRIES}"
   log "SWE-bench grading: deferred=${SWEBENCH_DEFER_GRADING} (1=prediction export now, pinned official harness later)"
-  log "SWE-bench dataset: rows=${SWEBENCH_DATASET_ROWS} unique_ids=${SWEBENCH_DATASET_UNIQUE_IDS} sha256=${SWEBENCH_DATASET_SHA256} formal=${FORMAL_SWEBENCH_VERIFIED}"
+  log "SWE-bench dataset: rows=${SWEBENCH_DATASET_ROWS} unique_ids=${SWEBENCH_DATASET_UNIQUE_IDS} converted_sha256=${SWEBENCH_DATASET_SHA256} official_sha256=${SWEBENCH_OFFICIAL_DATA_SHA256} formal=${FORMAL_SWEBENCH_VERIFIED}"
 fi
 
 if [[ "${EVAL_DRY_RUN}" == "1" ]]; then
@@ -754,6 +892,8 @@ if [[ "${EVAL_DRY_RUN}" == "1" ]]; then
   echo "[DRY_RUN] REF_LOAD=${REF_LOAD}"
   echo "[DRY_RUN] Megatron actor world=${ACTOR_WORLD_SIZE} tp=${MEGATRON_TP_SIZE}"
   echo "[DRY_RUN] SGLang rollout_gpus=${ROLLOUT_GPUS} gpus_per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE} engines=$((ROLLOUT_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))"
+  echo "[DRY_RUN] profile=${SWEBENCH_AGENT_PROFILE} max_turn=${MAX_TURN} max_total_tokens=${TERMINAL_MAX_TOTAL_TOKENS}"
+  echo "[DRY_RUN] SGLang context_length=${SGLANG_CONTEXT_LENGTH:-model-default} model_override=${SGLANG_JSON_MODEL_OVERRIDE_ARGS:-none}"
   for ((i=1; i<${#EVAL_PROMPT_DATA[@]}; i+=2)); do
     echo "[DRY_RUN] dataset ${EVAL_PROMPT_DATA[$((i-1))]}=${EVAL_PROMPT_DATA[$i]}"
   done
@@ -887,6 +1027,7 @@ EVAL_ARGS=(
   --eval-temperature "${EVAL_TEMPERATURE}"
   --eval-top-p "${EVAL_TOP_P}"
   --eval-top-k "${EVAL_TOP_K}"
+  --eval-min-p "${EVAL_MIN_P}"
 )
 
 ROLLOUT_ARGS=(
@@ -921,6 +1062,14 @@ SGLANG_ARGS=(
   --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC:-0.6}"
 )
+if [[ -n "${SGLANG_CONTEXT_LENGTH}" ]]; then
+  SGLANG_ARGS+=(--sglang-context-length "${SGLANG_CONTEXT_LENGTH}")
+fi
+if [[ -n "${SGLANG_JSON_MODEL_OVERRIDE_ARGS}" ]]; then
+  SGLANG_ARGS+=(
+    --sglang-json-model-override-args "${SGLANG_JSON_MODEL_OVERRIDE_ARGS}"
+  )
+fi
 if [[ "${EVAL_DETERMINISTIC}" == "1" ]]; then
   SGLANG_ARGS+=(--sglang-enable-deterministic-inference)
 fi
@@ -957,6 +1106,7 @@ EVAL_ONLY_ARGS=(
   "${CUSTOM_ARGS[@]}"
 )
 
+SGLANG_JSON_MODEL_OVERRIDE_CONFIG="${SGLANG_JSON_MODEL_OVERRIDE_ARGS:-null}"
 cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
 {
   "run_id": "${RUN_ID}",
@@ -978,19 +1128,26 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "sglang_engine_count": "$((ROLLOUT_GPUS / ROLLOUT_NUM_GPUS_PER_ENGINE))",
   "actor_world_size": "${ACTOR_WORLD_SIZE}",
   "megatron_tensor_model_parallel_size": "${MEGATRON_TP_SIZE}",
+  "swebench_agent_profile": "${SWEBENCH_AGENT_PROFILE}",
+  "harness_option": "${HARNESS_OPTION}",
   "max_turn": "${MAX_TURN}",
+  "terminal_max_total_tokens": "${TERMINAL_MAX_TOTAL_TOKENS}",
   "eval_n_samples": "${EVAL_N_SAMPLES}",
   "eval_temperature": "${EVAL_TEMPERATURE}",
   "eval_top_p": "${EVAL_TOP_P}",
   "eval_top_k": "${EVAL_TOP_K}",
+  "eval_min_p": "${EVAL_MIN_P}",
   "eval_seed": "${EVAL_SEED}",
   "rollout_seed": "${ROLLOUT_SEED}",
   "deterministic_inference": "${EVAL_DETERMINISTIC}",
   "sglang_request_timeout": "${SGLANG_REQUEST_TIMEOUT}",
   "thinking_mode": true,
   "model_name_or_path": "${SWEBENCH_MODEL_NAME_OR_PATH}",
+  "eval_max_prompt_len": "${EVAL_MAX_PROMPT_LEN}",
   "eval_max_response_len": "${EVAL_MAX_RESPONSE_LEN}",
   "eval_max_context_len": "${EVAL_MAX_CONTEXT_LEN}",
+  "sglang_context_length": "${SGLANG_CONTEXT_LENGTH}",
+  "sglang_json_model_override_args": ${SGLANG_JSON_MODEL_OVERRIDE_CONFIG},
   "eval_max_concurrency": "${EVAL_MAX_CONCURRENCY}",
   "swebench_worker_max_concurrent_builds": "${SWEBENCH_WORKER_MAX_CONCURRENT_BUILDS:-}",
   "env_remote_max_active_tasks": "${ENV_REMOTE_MAX_ACTIVE_TASKS:-}",
@@ -1019,6 +1176,8 @@ cat > "${RUN_DIR}/config/run_config.json" <<CFGEOF
   "swebench_dataset_rows": "${SWEBENCH_DATASET_ROWS}",
   "swebench_dataset_unique_ids": "${SWEBENCH_DATASET_UNIQUE_IDS}",
   "swebench_dataset_sha256": "${SWEBENCH_DATASET_SHA256}",
+  "swebench_official_dataset_path": "${SWEBENCH_RUN_OFFICIAL_DATA}",
+  "swebench_official_dataset_sha256": "${SWEBENCH_OFFICIAL_DATA_SHA256}",
   "metrics_jsonl": "${TERMINAL_METRICS_JSONL}"
 }
 CFGEOF

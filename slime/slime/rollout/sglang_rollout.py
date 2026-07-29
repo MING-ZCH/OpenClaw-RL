@@ -1022,6 +1022,8 @@ async def eval_rollout_single_dataset(
         no_stop_trim=True,
         spaces_between_special_tokens=False,
     )
+    if dataset_cfg.min_p is not None:
+        base_sampling_params["min_p"] = dataset_cfg.min_p
 
     eval_max_concurrency = int(
         os.getenv("EVAL_ROLLOUT_MAX_CONCURRENCY", "0") or 0

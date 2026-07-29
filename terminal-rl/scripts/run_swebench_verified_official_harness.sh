@@ -5,6 +5,7 @@ set -euo pipefail
 OFFICIAL_COMMIT="f7bbbb2ccdf479001d6467c9e34af59e44a840f9"
 OFFICIAL_VERSION="4.1.0"
 DATASET_NAME="princeton-nlp/SWE-bench_Verified"
+OFFICIAL_DATASET_SHA256="f61cd55ceb35b61ad592f645abcbfc8ea4d294c6c9f3c8f15e83211a8e8db98c"
 
 RUN_DIR="${RUN_DIR:-${1:-}}"
 if [[ -z "${RUN_DIR}" ]]; then
@@ -13,6 +14,7 @@ if [[ -z "${RUN_DIR}" ]]; then
 fi
 RUN_DIR="$(realpath -m -- "${RUN_DIR}")"
 PREDICTIONS_PATH="${PREDICTIONS_PATH:-${RUN_DIR}/swebench_official/predictions.jsonl}"
+DATASET_PATH="${DATASET_PATH:-${RUN_DIR}/config/swebench_verified_official_test.jsonl}"
 RESULTS_DIR="${RESULTS_DIR:-${RUN_DIR}/swebench_official/harness}"
 OFFICIAL_RUN_ID="${OFFICIAL_RUN_ID:-$(basename "${RUN_DIR}")-official}"
 MAX_WORKERS="${MAX_WORKERS:-4}"
@@ -20,6 +22,7 @@ OPEN_FILE_LIMIT="${OPEN_FILE_LIMIT:-65536}"
 EVAL_TIMEOUT="${EVAL_TIMEOUT:-1800}"
 CACHE_LEVEL="${CACHE_LEVEL:-env}"
 CLEAN="${CLEAN:-false}"
+OVERWRITE_OFFICIAL_RESULTS="${OVERWRITE_OFFICIAL_RESULTS:-0}"
 
 VENV_DIR="${SWEBENCH_VENV_DIR:-${HOME}/.cache/openclaw/swebench-${OFFICIAL_COMMIT:0:12}}"
 SOURCE_DIR="${SWEBENCH_SOURCE_DIR:-${HOME}/.cache/openclaw/SWE-bench-${OFFICIAL_COMMIT:0:12}}"
@@ -56,7 +59,10 @@ fi
   "${PREDICTIONS_PATH}" \
   "${OFFICIAL_COMMIT}" \
   "${OFFICIAL_VERSION}" \
-  "${SOURCE_DIR}" <<'PY'
+  "${SOURCE_DIR}" \
+  "${DATASET_PATH}" \
+  "${OFFICIAL_DATASET_SHA256}" <<'PY'
+import hashlib
 import importlib.metadata as metadata
 import importlib.util
 import json
@@ -67,8 +73,18 @@ predictions_path = Path(sys.argv[1])
 expected_commit = sys.argv[2]
 expected_version = sys.argv[3]
 source_dir = Path(sys.argv[4]).resolve()
+dataset_path = Path(sys.argv[5]).resolve()
+expected_dataset_sha256 = sys.argv[6]
 if not predictions_path.is_file():
     raise SystemExit(f"[ERROR] predictions file does not exist: {predictions_path}")
+if not dataset_path.is_file():
+    raise SystemExit(f"[ERROR] pinned dataset file does not exist: {dataset_path}")
+actual_dataset_sha256 = hashlib.sha256(dataset_path.read_bytes()).hexdigest()
+if actual_dataset_sha256 != expected_dataset_sha256:
+    raise SystemExit(
+        "[ERROR] pinned dataset fingerprint mismatch: "
+        f"actual={actual_dataset_sha256} expected={expected_dataset_sha256}"
+    )
 
 distribution = metadata.distribution("swebench")
 actual_version = distribution.version
@@ -100,9 +116,24 @@ for line_no, line in enumerate(predictions_path.read_text(encoding="utf-8").spli
     rows.append(row)
 if len(rows) != 500:
     raise SystemExit(f"[ERROR] official SWE-Verified requires 500 predictions; found {len(rows)}")
+dataset_rows = [
+    json.loads(line)
+    for line in dataset_path.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+dataset_ids = [str(row.get("instance_id", "")) for row in dataset_rows]
+if len(dataset_rows) != 500 or len(set(dataset_ids)) != 500:
+    raise SystemExit(
+        "[ERROR] pinned official SWE-Verified dataset must contain 500 unique rows"
+    )
+if set(dataset_ids) != ids:
+    raise SystemExit(
+        "[ERROR] prediction IDs do not match the pinned official dataset"
+    )
 print(
     f"[official-harness] preflight=ok predictions={len(rows)} "
-    f"swebench={actual_version}@{expected_commit} source={source_dir}"
+    f"dataset={dataset_path} swebench={actual_version}@{expected_commit} "
+    f"source={source_dir}"
 )
 PY
 
@@ -111,14 +142,39 @@ PY
 "${SWEBENCH_PYTHON}" -c \
   'from swebench.harness.run_evaluation import main; assert callable(main)'
 
-mkdir -p "${RESULTS_DIR}"
 if [[ "${HARNESS_PREFLIGHT_ONLY:-0}" == "1" ]]; then
   echo "[official-harness] preflight-only complete"
   exit 0
 fi
+if [[ -d "${RESULTS_DIR}" ]] &&
+   find "${RESULTS_DIR}" -mindepth 1 -print -quit | grep -q .; then
+  if [[ "${OVERWRITE_OFFICIAL_RESULTS}" != "1" ]]; then
+    echo "[ERROR] official harness result directory is not empty: ${RESULTS_DIR}" >&2
+    echo "        Use a new RUN_DIR/OFFICIAL_RUN_ID, or set OVERWRITE_OFFICIAL_RESULTS=1." >&2
+    exit 2
+  fi
+  rm -rf -- "${RESULTS_DIR}"
+fi
+mkdir -p "${RESULTS_DIR}"
+PREDICTIONS_SHA256="$(sha256sum "${PREDICTIONS_PATH}" | awk '{print $1}')"
+DATASET_SHA256="$(sha256sum "${DATASET_PATH}" | awk '{print $1}')"
+cat > "${RESULTS_DIR}/evaluation_manifest.json" <<EOF
+{
+  "swebench_commit": "${OFFICIAL_COMMIT}",
+  "swebench_version": "${OFFICIAL_VERSION}",
+  "dataset_name": "${DATASET_NAME}",
+  "dataset_path": "${DATASET_PATH}",
+  "dataset_sha256": "${DATASET_SHA256}",
+  "predictions_path": "${PREDICTIONS_PATH}",
+  "predictions_sha256": "${PREDICTIONS_SHA256}",
+  "official_run_id": "${OFFICIAL_RUN_ID}",
+  "image_namespace": "swebench",
+  "instance_image_tag": "latest"
+}
+EOF
 cd "${RESULTS_DIR}"
 exec "${SWEBENCH_PYTHON}" -m swebench.harness.run_evaluation \
-  --dataset_name "${DATASET_NAME}" \
+  --dataset_name "${DATASET_PATH}" \
   --split test \
   --predictions_path "${PREDICTIONS_PATH}" \
   --max_workers "${MAX_WORKERS}" \
@@ -128,4 +184,5 @@ exec "${SWEBENCH_PYTHON}" -m swebench.harness.run_evaluation \
   --clean "${CLEAN}" \
   --run_id "${OFFICIAL_RUN_ID}" \
   --namespace swebench \
+  --instance_image_tag latest \
   --report_dir "${RESULTS_DIR}"

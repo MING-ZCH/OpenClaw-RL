@@ -117,19 +117,25 @@ def write_official_artifacts(samples: Iterable[Any]) -> dict[str, Any] | None:
         if not instance_id:
             continue
         instance_id = str(instance_id)
+
+        status = _sample_status(sample)
+        technical_failure = (
+            status == "aborted"
+            or bool(getattr(sample, "remove_sample", False))
+            or metadata.get("evaluation_failed") is True
+        )
+        if technical_failure:
+            technical_failure_ids.add(instance_id)
+        # Multi-turn terminal trajectories contain one training Sample per turn.
+        # Only the final turn carries the prediction-export details.
+        if not details:
+            continue
         if instance_id in predictions:
             raise RuntimeError(
                 f"Duplicate SWE-bench prediction generated for {instance_id}"
             )
 
-        status = _sample_status(sample)
         generation_status_counts[status] = generation_status_counts.get(status, 0) + 1
-        if (
-            status == "aborted"
-            or bool(getattr(sample, "remove_sample", False))
-            or metadata.get("evaluation_failed") is True
-        ):
-            technical_failure_ids.add(instance_id)
         if details.get("grading_deferred") is True:
             deferred_grading_ids.add(instance_id)
 

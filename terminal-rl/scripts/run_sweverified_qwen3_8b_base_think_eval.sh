@@ -15,6 +15,16 @@ require_env() {
   fi
 }
 
+pin_formal_env() {
+  local name="$1"
+  local expected="$2"
+  if [[ -n "${!name:-}" && "${!name}" != "${expected}" ]]; then
+    echo "[ERROR] Formal profile requires ${name}=${expected}; got ${!name}." >&2
+    exit 2
+  fi
+  export "${name}=${expected}"
+}
+
 if [[ -n "${EVAL_LIMIT:-}" ]]; then
   echo "[ERROR] This formal launcher requires all 500 SWE-bench Verified instances; unset EVAL_LIMIT." >&2
   exit 2
@@ -25,6 +35,10 @@ if [[ -n "${SWEBENCH_EXPECTED_INSTANCES:-}" && "${SWEBENCH_EXPECTED_INSTANCES}" 
 fi
 if [[ -n "${SWEBENCH_EXPECTED_DATASET_SHA256:-}" && "${SWEBENCH_EXPECTED_DATASET_SHA256}" != "4282529dbcc1b9253fa91da35b9f1768a2002b391cc90ac6a4e64575d59cfbf3" ]]; then
   echo "[ERROR] Formal SWE-bench Verified dataset SHA256 is fixed to the official converted dataset." >&2
+  exit 2
+fi
+if [[ -n "${SWEBENCH_EXPECTED_OFFICIAL_DATASET_SHA256:-}" && "${SWEBENCH_EXPECTED_OFFICIAL_DATASET_SHA256}" != "f61cd55ceb35b61ad592f645abcbfc8ea4d294c6c9f3c8f15e83211a8e8db98c" ]]; then
+  echo "[ERROR] Formal official SWE-bench dataset SHA256 is fixed." >&2
   exit 2
 fi
 if [[ -n "${SWEBENCH_DEFER_GRADING:-}" && "${SWEBENCH_DEFER_GRADING}" != "1" ]]; then
@@ -46,39 +60,52 @@ export FORMAL_SWEBENCH_VERIFIED=1
 export SWEBENCH_DEFER_GRADING=1
 export SWEBENCH_EXPECTED_INSTANCES=500
 export SWEBENCH_EXPECTED_DATASET_SHA256="4282529dbcc1b9253fa91da35b9f1768a2002b391cc90ac6a4e64575d59cfbf3"
+export SWEBENCH_EXPECTED_OFFICIAL_DATASET_SHA256="f61cd55ceb35b61ad592f645abcbfc8ea4d294c6c9f3c8f15e83211a8e8db98c"
 export HF_CKPT
 export REF_LOAD
 export INIT_CKPT="${INIT_CKPT:-${REF_LOAD}}"
-export CUSTOM_CONFIG_PATH="${CUSTOM_CONFIG_PATH:-${TERMINAL_RL_DIR}/configs/rollout_qwen3_think.yaml}"
-export SWEBENCH_MODEL_NAME_OR_PATH="${SWEBENCH_MODEL_NAME_OR_PATH:-Qwen/Qwen3-8B}"
 
-# Qwen3 thinking-mode generation settings from the model generation_config.
-export EVAL_TEMPERATURE="${EVAL_TEMPERATURE:-0.6}"
-export EVAL_TOP_P="${EVAL_TOP_P:-0.95}"
-export EVAL_TOP_K="${EVAL_TOP_K:-20}"
-export EVAL_N_SAMPLES=1
-export EVAL_SEED="${EVAL_SEED:-1234}"
-export ROLLOUT_SEED="${ROLLOUT_SEED:-42}"
-export EVAL_DETERMINISTIC="${EVAL_DETERMINISTIC:-1}"
-export SGLANG_REQUEST_TIMEOUT="${SGLANG_REQUEST_TIMEOUT:-1800}"
+CANONICAL_CONFIG_PATH="${TERMINAL_RL_DIR}/configs/rollout_qwen3_think.yaml"
+if [[ -n "${CUSTOM_CONFIG_PATH:-}" && "${CUSTOM_CONFIG_PATH}" != "${CANONICAL_CONFIG_PATH}" ]]; then
+  echo "[ERROR] Formal profile requires CUSTOM_CONFIG_PATH=${CANONICAL_CONFIG_PATH}." >&2
+  exit 2
+fi
+export CUSTOM_CONFIG_PATH="${CANONICAL_CONFIG_PATH}"
+
+# Qwen3 official thinking-mode recommendations plus the fixed Terminal-RL
+# scaffold used for comparable SWE-bench Verified runs.
+pin_formal_env SWEBENCH_AGENT_PROFILE qwen3_official_think_64k_terminal_ref_v1
+pin_formal_env SWEBENCH_MODEL_NAME_OR_PATH Qwen/Qwen3-8B
+pin_formal_env HARNESS_OPTION camel-agent
+pin_formal_env EVAL_TEMPERATURE 0.6
+pin_formal_env EVAL_TOP_P 0.95
+pin_formal_env EVAL_TOP_K 20
+pin_formal_env EVAL_MIN_P 0
+pin_formal_env EVAL_N_SAMPLES 1
+pin_formal_env EVAL_MAX_PROMPT_LEN 32768
+pin_formal_env EVAL_MAX_RESPONSE_LEN 32768
+pin_formal_env EVAL_MAX_CONTEXT_LEN 65536
+pin_formal_env TERMINAL_MAX_TOTAL_TOKENS 65536
+pin_formal_env MAX_TURN 200
+pin_formal_env SGLANG_CONTEXT_LENGTH 65536
+pin_formal_env SGLANG_JSON_MODEL_OVERRIDE_ARGS '{"rope_scaling":{"rope_type":"yarn","factor":2.0,"original_max_position_embeddings":32768}}'
+pin_formal_env EVAL_SEED 1234
+pin_formal_env ROLLOUT_SEED 42
+pin_formal_env EVAL_DETERMINISTIC 1
+pin_formal_env SGLANG_REQUEST_TIMEOUT 1800
 
 # Two TP=2 SGLang engines keep all four H20 GPUs active while the worker runs
 # up to four independent Docker tasks.
-export NUM_GPUS="${NUM_GPUS:-4}"
-export ROLLOUT_GPUS="${ROLLOUT_GPUS:-4}"
-export ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
+pin_formal_env NUM_GPUS 4
+pin_formal_env ROLLOUT_GPUS 4
+pin_formal_env ROLLOUT_NUM_GPUS_PER_ENGINE 2
 # eval-only declares a one-rank dummy Megatron actor for argument validation;
 # its TP must remain 1 and is unrelated to the two-GPU SGLang engine TP above.
-export ACTOR_NUM_NODES=1
-export ACTOR_NUM_GPUS_PER_NODE=1
-export MEGATRON_TP_SIZE=1
-export EVAL_MAX_CONCURRENCY="${EVAL_MAX_CONCURRENCY:-4}"
-export SWEBENCH_WORKER_MAX_CONCURRENT_BUILDS="${SWEBENCH_WORKER_MAX_CONCURRENT_BUILDS:-1}"
-
-if [[ "${NUM_GPUS}" != "4" || "${ROLLOUT_GPUS}" != "4" || "${ROLLOUT_NUM_GPUS_PER_ENGINE}" != "2" || "${EVAL_MAX_CONCURRENCY}" != "4" ]]; then
-  echo "[ERROR] Formal launcher requires NUM_GPUS=4, ROLLOUT_GPUS=4, ROLLOUT_NUM_GPUS_PER_ENGINE=2, EVAL_MAX_CONCURRENCY=4." >&2
-  exit 2
-fi
+pin_formal_env ACTOR_NUM_NODES 1
+pin_formal_env ACTOR_NUM_GPUS_PER_NODE 1
+pin_formal_env MEGATRON_TP_SIZE 1
+pin_formal_env EVAL_MAX_CONCURRENCY 4
+pin_formal_env SWEBENCH_WORKER_MAX_CONCURRENT_BUILDS 1
 
 cd "${REPO_ROOT}"
 exec bash "${TERMINAL_RL_DIR}/terminal-rl_qwen3-8b_eval_pu.sh"

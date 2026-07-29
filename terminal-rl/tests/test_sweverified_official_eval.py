@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,6 +25,12 @@ SWE_UTILS_PATH = TERMINAL_RL / "remote" / "swe_task_utils.py"
 WORKER = TERMINAL_RL / "remote" / "run_pool_server_sweverified_pu.sh"
 EVAL_LAUNCHER = (
     TERMINAL_RL / "scripts" / "run_sweverified_qwen3_8b_base_think_eval.sh"
+)
+GENERIC_EVAL_LAUNCHER = TERMINAL_RL / "terminal-rl_qwen3-8b_eval_pu.sh"
+SLIME_ARGUMENTS = ROOT / "slime" / "slime" / "utils" / "arguments.py"
+SLIME_EVAL_CONFIG = ROOT / "slime" / "slime" / "utils" / "eval_config.py"
+SLIME_SGLANG_ROLLOUT = (
+    ROOT / "slime" / "slime" / "rollout" / "sglang_rollout.py"
 )
 OFFICIAL_HARNESS = (
     TERMINAL_RL / "scripts" / "run_swebench_verified_official_harness.sh"
@@ -153,6 +160,11 @@ def test_formal_conversion_rejects_local_or_truncated_sources(
     stats = converter.convert(args)
     assert stats["converted"] == 1
     assert stats["unique_instance_ids"] == 1
+    official_path = Path(stats["official_output_path"])
+    assert official_path.is_file()
+    assert json.loads(official_path.read_text(encoding="utf-8"))["instance_id"] == (
+        "django__django-11099"
+    )
 
 
 def test_prediction_artifacts_have_official_schema_and_complete_coverage(
@@ -223,6 +235,61 @@ def test_prediction_artifacts_have_official_schema_and_complete_coverage(
         report.write_official_artifacts([samples[0], samples[0]])
 
 
+def test_prediction_export_ignores_nonfinal_multi_turn_samples(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instance_id = "owner__repo-1"
+    dataset = tmp_path / "test.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "swe_instance_id": instance_id,
+                    "task_name": instance_id,
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    results = tmp_path / "official"
+    monkeypatch.setenv("SWEBENCH_RESULTS_DIR", str(results))
+    monkeypatch.setenv("SWEBENCH_EVAL_DATA_PATH", str(dataset))
+
+    common = {
+        "task_meta": {"swe_instance_id": instance_id},
+        "uid": "trajectory-1",
+        "num_turns": 2,
+    }
+    first = SimpleNamespace(
+        status="completed",
+        remove_sample=False,
+        prompt={},
+        metadata={**common, "turn_idx": 0},
+    )
+    final = SimpleNamespace(
+        status="completed",
+        remove_sample=False,
+        prompt={},
+        metadata={
+            **common,
+            "turn_idx": 1,
+            "reward_details": {
+                "instance_id": instance_id,
+                "grader": "swebench_prediction_export",
+                "grading_deferred": True,
+                "model_patch": "diff --git a/a b/a\n",
+            },
+        },
+    )
+
+    summary = report.write_official_artifacts([first, final])
+    assert summary is not None
+    assert summary["submitted"] == 1
+    assert summary["pending_official_grading"] == 1
+    assert summary["generation_status_counts"] == {"completed": 1}
+
+
 def test_launchers_pin_formal_dataset_model_and_official_harness() -> None:
     worker = WORKER.read_text(encoding="utf-8")
     launcher = EVAL_LAUNCHER.read_text(encoding="utf-8")
@@ -242,16 +309,82 @@ def test_launchers_pin_formal_dataset_model_and_official_harness() -> None:
     assert "require_env HF_CKPT" in launcher
     assert "require_env REF_LOAD" in launcher
     assert 'export INIT_CKPT="${INIT_CKPT:-${REF_LOAD}}"' in launcher
-    assert "EVAL_N_SAMPLES=1" in launcher
+    assert "pin_formal_env EVAL_N_SAMPLES 1" in launcher
     assert "ROLLOUT_NUM_GPUS_PER_ENGINE" in launcher
     assert "Qwen/Qwen3-8B" in launcher
     assert converter.SWEBENCH_COMMIT in harness
     assert converter.DATASET_NAME in harness
     assert "swebench.harness.run_evaluation" in harness
     assert "len(rows) != 500" in harness
+    assert "swebench_verified_official_test.jsonl" in harness
+    assert '--dataset_name "${DATASET_PATH}"' in harness
+    assert "OVERWRITE_OFFICIAL_RESULTS" in harness
+    assert "predictions_sha256" in harness
+    assert "--instance_image_tag latest" in harness
     assert "HARNESS_PREFLIGHT_ONLY" in harness
     assert "pip install --editable" in harness
     assert "from swebench.harness.run_evaluation import main" in harness
+
+
+def test_formal_qwen_profile_is_fixed_and_explicit() -> None:
+    launcher = EVAL_LAUNCHER.read_text(encoding="utf-8")
+    generic = GENERIC_EVAL_LAUNCHER.read_text(encoding="utf-8")
+    arguments = SLIME_ARGUMENTS.read_text(encoding="utf-8")
+    eval_config = SLIME_EVAL_CONFIG.read_text(encoding="utf-8")
+    rollout = SLIME_SGLANG_ROLLOUT.read_text(encoding="utf-8")
+
+    expected_pins = {
+        "SWEBENCH_AGENT_PROFILE": "qwen3_official_think_64k_terminal_ref_v1",
+        "SWEBENCH_MODEL_NAME_OR_PATH": "Qwen/Qwen3-8B",
+        "HARNESS_OPTION": "camel-agent",
+        "EVAL_TEMPERATURE": "0.6",
+        "EVAL_TOP_P": "0.95",
+        "EVAL_TOP_K": "20",
+        "EVAL_MIN_P": "0",
+        "EVAL_MAX_PROMPT_LEN": "32768",
+        "EVAL_MAX_RESPONSE_LEN": "32768",
+        "EVAL_MAX_CONTEXT_LEN": "65536",
+        "TERMINAL_MAX_TOTAL_TOKENS": "65536",
+        "MAX_TURN": "200",
+        "SGLANG_CONTEXT_LENGTH": "65536",
+    }
+    for name, value in expected_pins.items():
+        assert f"pin_formal_env {name} {value}" in launcher
+
+    assert '"rope_type":"yarn","factor":2.0' in launcher
+    assert "--eval-min-p" in generic
+    assert "--sglang-context-length" in generic
+    assert "--sglang-json-model-override-args" in generic
+    assert 'cfg["terminal_agent_type"] = "camel_agent"' in generic
+    assert 'cfg["max_total_tokens"] = max_total_tokens' in generic
+    assert '"max_position_embeddings": 40960' in generic
+    assert 'parser.add_argument("--eval-min-p"' in arguments
+    assert '"min_p": {' in eval_config
+    assert 'base_sampling_params["min_p"] = dataset_cfg.min_p' in rollout
+
+
+def test_formal_launcher_rejects_sampling_override() -> None:
+    env = os.environ.copy()
+    env.update(
+        {
+            "WORKER_URLS": "http://127.0.0.1:18083",
+            "HF_CKPT": "/tmp/qwen3-8b",
+            "REF_LOAD": "/tmp/qwen3-8b-dist",
+            "TRAIN_PYTHON": sys.executable,
+            "EVAL_TEMPERATURE": "0.7",
+        }
+    )
+    proc = subprocess.run(
+        ["bash", str(EVAL_LAUNCHER)],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 2
+    assert "Formal profile requires EVAL_TEMPERATURE=0.6" in proc.stderr
 
 
 def test_worker_rejects_explicit_python_that_cannot_import_pool_server() -> None:

@@ -57,7 +57,9 @@ flock -n 9 || {
 }
 
 if [[ "${OVERWRITE}" != "1" ]] &&
-   { [[ -e "${OUTPUT_DIR}/test.jsonl" ]] || [[ -d "${ENV_DIR}" ]]; }; then
+   { [[ -e "${OUTPUT_DIR}/test.jsonl" ]] ||
+     [[ -e "${OUTPUT_DIR}/official_test.jsonl" ]] ||
+     [[ -d "${ENV_DIR}" ]]; }; then
   echo "[ERROR] target artifacts already exist; set OVERWRITE=1 to regenerate." >&2
   exit 2
 fi
@@ -73,6 +75,7 @@ fi
 
 echo "[sweverified-data] mode=${MODE}"
 echo "[sweverified-data] output=${OUTPUT_DIR}/test.jsonl"
+echo "[sweverified-data] official_dataset=${OUTPUT_DIR}/official_test.jsonl"
 echo "[sweverified-data] env_dir=${ENV_DIR}"
 
 "${PYTHON_BIN}" "${SCRIPT_DIR}/convert_sweverified_to_terminal_rl.py" \

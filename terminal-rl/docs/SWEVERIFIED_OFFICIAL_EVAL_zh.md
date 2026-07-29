@@ -6,10 +6,10 @@
 SWE-bench Verified 的标准评测链路，目标模型为 `Qwen/Qwen3-8B` 基模，
 默认开启 thinking mode。
 
-代码分支 `zch/sweverified-terminal-rl-eval` 从 SWE-smith PR #18 的最新
-head `97518bc8` 直接切出。应先合并 SWE-smith PR；若上游采用 squash merge，
-再将本分支 rebase 到更新后的上游目标分支后提交，确保新 PR 只展示
-SWE-bench Verified 相关差异。
+代码分支 `zch/sweverified-terminal-rl-eval` 最初从 SWE-smith PR #18 的
+head `97518bc8` 切出，之后通过提交 `3780606d` 同步上游最新 harness。
+因此 PR #22 依赖 SWE-smith 的通用 Docker lifecycle；合并顺序仍应为
+SWE-smith 在前、SWE-bench Verified 在后。
 
 SWE-bench Verified 是 **eval benchmark**，不是训练数据集。完整流程分为：
 
@@ -35,6 +35,19 @@ worker 内部不会自行宣称 `resolved`，也不会用自定义测试结果�
 - [SWE-bench evaluation guide](https://www.swebench.com/SWE-bench/guides/evaluation/)
 - [SWE-bench harness reference](https://www.swebench.com/SWE-bench/reference/harness/)
 - [SWE-bench Verified dataset](https://huggingface.co/datasets/princeton-nlp/SWE-bench_Verified)
+- [Qwen3-8B model card](https://huggingface.co/Qwen/Qwen3-8B)
+
+### 1.1 “官方配置”的边界
+
+这里区分三类配置：
+
+- **SWE-bench 官方标准**：500 条 Verified test split、官方 prediction
+  schema、官方 Docker image 与 `swebench.harness.run_evaluation`；
+- **Qwen 官方推理建议**：thinking mode 下
+  `temperature=0.6/top_p=0.95/top_k=20/min_p=0`，避免 greedy decoding；
+- **Terminal-RL agent scaffold**：`camel-agent`、工具协议、最大 turn 和总
+  token budget。SWE-bench 官方不规定 agent scaffold，因此这些参数以固定
+  profile 记录，而不宣称为 SWE-bench 官方参数。
 
 ## 2. 关键文件
 
@@ -66,6 +79,7 @@ bash terminal-rl/data_utils/download_sweverified.sh
 
 ```text
 terminal-rl/dataset/sweverified_convert/test.jsonl
+terminal-rl/dataset/sweverified_convert/official_test.jsonl
 terminal-rl/dataset/sweverified_convert/convert_stats.json
 terminal-rl/dataset/sweverified_env/<instance_id>/
 ```
@@ -75,6 +89,17 @@ terminal-rl/dataset/sweverified_env/<instance_id>/
 ```text
 4282529dbcc1b9253fa91da35b9f1768a2002b391cc90ac6a4e64575d59cfbf3
 ```
+
+供官方 harness 评分的 `official_test.jsonl` 预期 SHA256：
+
+```text
+f61cd55ceb35b61ad592f645abcbfc8ea4d294c6c9f3c8f15e83211a8e8db98c
+```
+
+两个文件均由同一固定 Hugging Face revision 在同一转换事务中生成，并在
+正式 generation preflight 中校验 ID 集合一致。正式 run 会把
+`official_test.jsonl` 复制到 `runs/<run_id>/config/`，确保后续评分不再读取
+Hugging Face 的可变默认 revision。
 
 需要重建时显式增加 `OVERWRITE=1`。转换和 worker 共享
 `.sweverified_artifact.lock`，避免 worker 读取发布中的 artifact。
@@ -167,8 +192,20 @@ bash terminal-rl/scripts/run_sweverified_qwen3_8b_base_think_eval.sh
 - 2 个 `TP=2` SGLang engine；
 - `EVAL_MAX_CONCURRENCY=4`；
 - thinking mode；
-- `temperature=0.6`、`top_p=0.95`、`top_k=20`；
+- profile：`qwen3_official_think_64k_terminal_ref_v1`；
+- Qwen 官方 sampling：
+  `temperature=0.6`、`top_p=0.95`、`top_k=20`、`min_p=0`；
+- `prompt=32768`、`response=32768`、总 context `65536`；
+- Qwen 官方 YaRN 方案：`factor=2.0`、
+  `original_max_position_embeddings=32768`；
+- Terminal-RL scaffold：`camel-agent`、`MAX_TURN=200`、
+  `max_total_tokens=65536`；
 - worker 仅导出 patch，不在生成阶段计算 `resolved`。
+
+使用 64K YaRN 的原因是 coding agent 的多轮工具历史可能超过 32K。Qwen
+官方同时说明 static YaRN 可能影响短文本，因此该 profile 只用于需要长历史的
+SWE-bench agent eval，不应自动套用到普通短文本评测。launcher 对以上参数
+fail-closed，外部覆盖任一固定值都会退出。
 
 生成阶段只有同时满足以下条件才返回成功：
 
@@ -211,7 +248,17 @@ bash terminal-rl/scripts/run_swebench_verified_official_harness.sh
    `instance_id/model_name_or_path/model_patch`；
 4. 在启动 Docker 前 import 完整 harness，防止普通 wheel 漏打包
    `constants/fixtures`；
-5. 调用官方 `swebench.harness.run_evaluation`。
+5. 使用 run 内固定且带 SHA256 的 `official_test.jsonl`，调用官方
+   `swebench.harness.run_evaluation`；
+6. 显式使用官方 `namespace=swebench`、`instance_image_tag=latest`。
+
+官方 harness 本身以 `latest` 标识 instance image，未提供官方 digest
+manifest。脚本会在 `evaluation_manifest.json` 记录 dataset、prediction
+SHA256、harness commit 和 image tag，但不能把 upstream `latest` 描述为
+内容不可变。
+
+为避免官方 harness 复用旧 `report.json`，评分目录非空时脚本默认拒绝运行。
+需要有意识地覆盖旧结果时，显式设置 `OVERWRITE_OFFICIAL_RESULTS=1`。
 
 最终结果位于：
 
@@ -224,18 +271,25 @@ runs/<run_id>/swebench_official/harness/
 
 ## 8. 本地验证结果
 
-当前分支的 merge-base 为最新 SWE-smith PR head `97518bc8`，相对该基线
-仅包含 SWE-bench Verified 范围的提交。针对当前代码已完成：
+针对当前代码已完成：
 
 - 固定 Hugging Face revision 完整转换 `500/500`；
 - task dir 生成 `500/500`，canonical JSONL SHA256 为
   `4282529dbcc1b9253fa91da35b9f1768a2002b391cc90ac6a4e64575d59cfbf3`；
-- SWE-Verified、SWE-smith converter、Docker lifecycle 与 close lifecycle
-  focused regression：`97 passed`；
+- 官方评分 JSONL 生成 `500/500`，SHA256 为
+  `f61cd55ceb35b61ad592f645abcbfc8ea4d294c6c9f3c8f15e83211a8e8db98c`；
+- SWE-Verified、SWE-smith converter、Docker lifecycle、router 与 close
+  lifecycle focused regression：`102 passed`；
+- 当前分支完整 `terminal-rl/tests`（显式配置
+  `TAU2_BENCH_ROOT`）：`176 passed`；
 - shell `bash -n`、Python compile、`git diff --check`：通过；
 - 正式 launcher `EVAL_DRY_RUN=1`：通过；实际校验
   Qwen3-8B revision `b968826d...`、模型 artifact manifest、500 条数据指纹和
-  全部 runtime path；
+  全部 runtime path，并输出固定 `64K` profile；
+- tokenizer audit：500 条初始 prompt 最大约 `8406` token，1 条超过
+  `8192`，0 条超过 `32768`；多轮工具历史由 64K total-token budget 约束；
+- 多轮 trajectory 回归：只在最后一 turn 导出一个 `model_patch`，不会因
+  同一 instance 的 turn samples 触发 duplicate prediction；
 - 4 卡正式 topology 为 `2 x TP=2`，Megatron eval-only 占位 topology 为
   `world=1 / TP=1`，避免二者误复用导致 world-size assertion。
 

@@ -23,6 +23,12 @@ DATASET_REVISION = "c104f840cc67f8b6eec6f759ebc8b2693d585d4a"
 SWEBENCH_VERSION = "4.1.0"
 SWEBENCH_COMMIT = "f7bbbb2ccdf479001d6467c9e34af59e44a840f9"
 OFFICIAL_INSTANCE_COUNT = 500
+CONVERTED_DATA_SHA256 = (
+    "4282529dbcc1b9253fa91da35b9f1768a2002b391cc90ac6a4e64575d59cfbf3"
+)
+OFFICIAL_DATA_SHA256 = (
+    "f61cd55ceb35b61ad592f645abcbfc8ea4d294c6c9f3c8f15e83211a8e8db98c"
+)
 TASK_FORMAT_VERSION = "sweverified-terminal-rl-v1"
 TASK_FORMAT_MARKER = ".terminal-rl-sweverified-format.json"
 GENERATED_TASK_FILES = (
@@ -325,6 +331,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-jsonl")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--output-name", default="test.jsonl")
+    parser.add_argument("--official-output-name", default="official_test.jsonl")
     parser.add_argument("--stats-name", default="convert_stats.json")
     parser.add_argument("--env-dir")
     parser.add_argument("--max-samples", type=int)
@@ -340,6 +347,9 @@ def parse_args() -> argparse.Namespace:
 def convert(args: argparse.Namespace) -> dict:
     out_dir = Path(args.output_dir)
     out_path = out_dir / args.output_name
+    official_out_path = out_dir / getattr(
+        args, "official_output_name", "official_test.jsonl"
+    )
     stats_path = out_dir / args.stats_name
     env_dir = (
         Path(args.env_dir)
@@ -348,8 +358,12 @@ def convert(args: argparse.Namespace) -> dict:
     )
     if env_dir.name != "sweverified_env":
         raise SystemExit("[ERROR] --env-dir must end with sweverified_env")
-    if out_path.exists() and not args.overwrite_output:
-        raise SystemExit(f"[ERROR] output exists: {out_path}")
+    if (
+        out_path.exists() or official_out_path.exists()
+    ) and not args.overwrite_output:
+        raise SystemExit(
+            f"[ERROR] output exists: {out_path} or {official_out_path}"
+        )
     if args.formal and args.max_samples is not None:
         raise SystemExit("[ERROR] formal conversion forbids --max-samples")
     if args.formal and args.input_jsonl:
@@ -364,19 +378,29 @@ def convert(args: argparse.Namespace) -> dict:
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = out_path.with_suffix(f"{out_path.suffix}.tmp.{os.getpid()}")
+    official_tmp_path = official_out_path.with_suffix(
+        f"{official_out_path.suffix}.tmp.{os.getpid()}"
+    )
     ids: set[str] = set()
     converted = 0
     created = 0
     existing = 0
     try:
-        with tmp_path.open("w", encoding="utf-8") as output:
+        with (
+            tmp_path.open("w", encoding="utf-8") as output,
+            official_tmp_path.open("w", encoding="utf-8") as official_output,
+        ):
             for sample in source:
-                item = convert_sample(sample)
+                official_sample = _unwrap_sample(sample)
+                item = convert_sample(official_sample)
                 instance_id = item["metadata"]["swe_instance_id"]
                 if instance_id in ids:
                     raise ValueError(f"duplicate instance_id: {instance_id}")
                 ids.add(instance_id)
                 output.write(json.dumps(item, ensure_ascii=False) + "\n")
+                official_output.write(
+                    json.dumps(official_sample, ensure_ascii=False) + "\n"
+                )
                 if args.create_env_dirs:
                     if create_task_dir(
                         item,
@@ -394,9 +418,25 @@ def convert(args: argparse.Namespace) -> dict:
                 f"formal conversion requires {OFFICIAL_INSTANCE_COUNT} rows; "
                 f"found {converted}"
             )
+        converted_digest = hashlib.sha256(tmp_path.read_bytes()).hexdigest()
+        official_digest = hashlib.sha256(
+            official_tmp_path.read_bytes()
+        ).hexdigest()
+        if args.formal and converted_digest != CONVERTED_DATA_SHA256:
+            raise ValueError(
+                "formal converted dataset fingerprint mismatch: "
+                f"actual={converted_digest} expected={CONVERTED_DATA_SHA256}"
+            )
+        if args.formal and official_digest != OFFICIAL_DATA_SHA256:
+            raise ValueError(
+                "formal official dataset fingerprint mismatch: "
+                f"actual={official_digest} expected={OFFICIAL_DATA_SHA256}"
+            )
         tmp_path.replace(out_path)
+        official_tmp_path.replace(official_out_path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
+        official_tmp_path.unlink(missing_ok=True)
         raise
 
     stats = {
@@ -412,6 +452,10 @@ def convert(args: argparse.Namespace) -> dict:
         "env_existing": existing,
         "output_path": str(out_path),
         "output_sha256": hashlib.sha256(out_path.read_bytes()).hexdigest(),
+        "official_output_path": str(official_out_path),
+        "official_output_sha256": hashlib.sha256(
+            official_out_path.read_bytes()
+        ).hexdigest(),
     }
     stats_path.write_text(
         json.dumps(stats, ensure_ascii=False, indent=2) + "\n",

@@ -80,6 +80,9 @@ class _FakeRouter:
     def num_workers(self):
         return len(self.workers)
 
+    async def maybe_reload_workers(self):
+        return None
+
     async def worker_readiness(self, worker_url, timeout=5.0):
         idx = self.workers.index(worker_url)
         result = self._results[idx]

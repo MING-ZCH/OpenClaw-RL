@@ -4147,11 +4147,13 @@ async def generate(
             )
             if turn_uncertainty:
                 s.metadata["turn_uncertainty"] = turn_uncertainty
-            if eval_details is not None:
-                s.metadata["reward_details"] = _jsonable(eval_details)
             if eval_error is not None:
                 s.metadata["evaluation_failed"] = True
                 s.metadata["evaluation_error"] = eval_error
+        # A terminal trajectory produces one Sample per model turn, but
+        # SWE-bench expects exactly one final patch per instance.
+        if eval_details is not None and samples:
+            samples[-1].metadata["reward_details"] = _jsonable(eval_details)
         _mark_non_trainable_samples(samples)
 
         _save_rollout_artifacts(
